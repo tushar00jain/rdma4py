@@ -41,6 +41,13 @@ and transports remain subject to provider and device support.
 retaining their allocations. `ibverbs.cuda.register_tensor` exports CUDA
 memory as dma-buf when available and falls back to `nvidia_peermem`.
 
+`ibverbs.allreduce` optionally adds a pure-Python, CuTe-JIT `SUM` all-reduce
+over GPUNetIO-exported GPUDirect RC QPs. A persistent GPU kernel posts and
+polls one QP per channel and enforces the whole-collective timeout on device.
+It uses no NCCL or NVLink transport and supports c10d-shaped membership handles
+and reconfiguration after a rank failure. Install its JIT dependency with
+`pip install './ibverbs[allreduce]'` when working from this repository.
+
 The full transport, API coverage, and GPUDirect guide is maintained in the
 [ibverbs package README](https://github.com/d4l3k/rdma4py/tree/main/ibverbs).
 

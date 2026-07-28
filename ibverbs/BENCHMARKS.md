@@ -107,3 +107,62 @@ taskset -c 0 env PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 The script prints JSON containing the topology metadata, iteration counts,
 and unrounded results. Change the GPU/HCA arguments only as pairs after
 checking locality with `nvidia-smi topo -m`.
+
+## CuTe all-reduce versus NCCL
+
+Measured on GPU 0/`mlx5_0` and GPU 1/`mlx5_3` on 2026-07-27. Both
+implementations used a rank-ordered Ring/Simple algorithm, a 4 MiB protocol
+buffer, and the same 64-CTA ceiling. NCCL's P2P and shared-memory transports were
+disabled, so its baseline also crossed the IB/RoCE network instead of NVLink.
+The optional ibverbs implementation used the direct GPUNetIO transport with
+one RC QP per channel (64 QPs). The timed tensors were typed views of its
+registered work buffer, avoiding extra staging copies.
+
+| Payload | ibverbs/CuTe latency | NCCL latency | ibverbs/CuTe alg. BW | NCCL alg. BW | Bit exact |
+|---:|---:|---:|---:|---:|:---:|
+| 1 MiB | 1.624 ms | **0.245 ms** | 0.65 GB/s | **4.28 GB/s** | ✅ |
+| 16 MiB | **0.492 ms** | 0.653 ms | **34.10 GB/s** | 25.69 GB/s | ✅ |
+| 64 MiB | **1.545 ms** | 1.677 ms | **43.43 GB/s** | 40.02 GB/s | ✅ |
+
+The two-rank exact-byte matrix passed at 16 B, the three sizes on each side of
+the 32 KiB and 64 KiB scheduling boundaries, and 1 MiB for float16, bfloat16,
+float32, float64, float8 E4M3FN/E5M2, int8, uint8, int32, uint32, int64, and
+uint64. This covers all 12 NCCL 2.29 datatypes on SM90, where NCCL enables FP8
+reduction. Inputs include NaNs, infinities, signed zero, subnormals, and integer
+overflow. A three-rank floating-point boundary run also passed before the
+survivors rebuilt a two-rank ring after removing rank 2.
+
+The missing-participant test uses a 50 ms GPU deadline. It verifies
+`AllReduceTimeoutError`, rejection of further work on the poisoned group,
+fresh-QP reconfiguration, and an exact post-recovery collective.
+
+The benchmark preconditions the GPUs and NICs on the largest timed payload
+before either implementation is measured, reducing idle-clock bias. The 1 MiB
+case remains latency-bound by CuTe launch, GPU CQ polling, GPUDirect acquire
+fencing, CTA barriers, and the host-visible status check. Payload dominates
+those fixed costs at 16 MiB and above, where this GPUNetIO ring exceeds the
+network-only NCCL baseline. The table records steady-state warmed medians, not
+cold-call latency; short-message GPUNetIO results were also more variable.
+
+### All-reduce channel scaling
+
+For GPUNetIO, a QP must be owned by one channel so untagged receives cannot be
+consumed by another independently scheduled CTA. The benchmark therefore
+swept the CuTe SM/CTA count and the NCCL CTA ceiling together, with the same
+number of QPs. Sixty-four was fastest at 64 MiB on this H100/ConnectX-7 pair.
+
+| SM/CTAs and QPs | 64 MiB latency | Algorithm bandwidth |
+|---:|---:|---:|
+| 32 | 1.796 ms | 37.37 GB/s |
+| 48 | 3.091 ms | 21.71 GB/s |
+| 64 | **1.545 ms** | **43.43 GB/s** |
+
+Reproduce the comparison (the script sets the NCCL controls before importing
+torch):
+
+```bash
+torchrun --standalone --nproc-per-node=2 ibverbs/benchmarks/allreduce.py \
+  --gpus 0,1 --hcas mlx5_0,mlx5_3 --sms 64 \
+  --sizes 1m,16m,64m --warmups 10 --iterations 30 \
+  --timeout-smoke-test
+```

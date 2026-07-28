@@ -244,8 +244,9 @@ def write_kernel(qp: Uint64, remote: Uint64, rkey: Uint32,
     gda.wait_send(qp, ticket)
 ```
 
-The initial ABI includes RDMA Write/Read, Send/Receive, blocking completion
-waits, and one-shot completion tests. `get_mcst` and `wait_recv_mcst` add the
+The ABI includes RDMA Write/Read, Write-with-Immediate, Send/Receive, blocking
+completion waits, deadline-aware waits, and one-shot completion tests.
+`get_mcst` and `wait_recv_mcst` add the
 DOCA dump-WQE memory-consistency sequence required on pre-Hopper GPUs; their
 dump address must name at least one registered writable byte. Transfer lengths
 must be positive, and a Receive is limited to `2**32 - 1` bytes.
@@ -272,6 +273,75 @@ than silently putting the CPU back on the critical path. CPU-proxy mode needs a
 host thread to call `progress()` while a kernel can be posting work. The GPU and
 NIC should also have a GPUDirect-friendly PCIe path for useful performance.
 
+## Optional CuTe all-reduce
+
+`ibverbs.allreduce` is a pure-Python, one-process-per-GPU Ring/Simple
+all-reduce. Its default transport exports one RC QP per CuTe channel to
+GPUNetIO and runs WQE construction, RDMA_WRITE_WITH_IMM doorbells, completion
+polling, timeout checks, and `SUM` reduction in one persistent GPU kernel. It
+uses no CUDA IPC, NVLink, or NCCL. A slower `transport="host"` fallback remains
+available. The base package still imports without torch, CUDA, or CuTe. The
+optional CuTe dependency requires Python 3.10 or newer, plus the DOCA GPUNetIO
+runtime and development headers described above.
+
+```bash
+pip install './ibverbs[allreduce]'
+```
+
+Each rank creates a `ProcessGroup` with an open context/PD and two distinct,
+VMM-backed CUDA byte buffers sized for the largest collective. Exchange the
+opaque handles through the application's store, then initialize the group:
+
+```python
+from ibverbs.allreduce import ProcessGroup
+
+group = ProcessGroup(
+    ctx, pd, work_buffer, scratch_buffer,
+    stable_rank=global_rank, gid_index=gid_index,
+    advertise_host=hostname, num_sms=32, timeout=30,
+)
+handle = group.get_reconfigure_handle()
+# handles = store.all_gather(handle), ordered by desired rank
+group.reconfigure(uuid=1, handles=handles).wait()
+group.allreduce(cuda_tensor)  # SUM, in place, with a whole-operation timeout
+```
+
+GPUNetIO defaults to 32 QPs for 32 SM/CTAs so every active channel owns its
+receive queue; set `qps >= num_sms` explicitly to reserve more. Passing a typed
+view of `work_buffer` avoids both staging copies. Device completion loops use a
+`clock64()` deadline and return `AllReduceTimeoutError` without depending on a
+host polling thread.
+
+On a rank or link failure, the current operation raises and its tensor is
+undefined. Survivors exchange a new ordered handle list and call
+`reconfigure()` with a fresh UUID before retrying from an intact input. This
+matches c10d's handle/UUID/membership shape; reconfiguration itself is
+synchronous and returns an already-completed `Work`.
+
+The arithmetic, dynamic channel count, and chunk schedule match NCCL 2.29
+Ring/Simple. Bitwise comparison also requires NCCL to use the same rank-ordered
+rings, CTA ceiling, and 4 MiB protocol buffer—algorithm or topology changes
+alter floating-point reduction order. The benchmark pins the algorithm,
+protocol, CTA ceiling, and buffer size, disables NCCL's NVLink/shared-memory
+paths, and compares raw bytes for fp8 E4M3FN/E5M2, fp16, bf16, fp32, fp64,
+int8/uint8, int32/uint32, and int64/uint64. This is the complete NCCL 2.29
+datatype set; like NCCL, FP8 reduction requires SM90 or newer. Its tiny native
+NCCL reference wrapper is benchmark-only;
+`ibverbs.allreduce` never imports or links NCCL.
+
+Order `handles` to match NCCL's reported ring (`NCCL_DEBUG_SUBSYS=GRAPH`) when
+using NCCL as the bitwise oracle on a topology whose ring is not rank ordered.
+
+```bash
+torchrun --standalone --nproc-per-node=2 ibverbs/benchmarks/allreduce.py \
+  --gpus 0,1 --hcas mlx5_0,mlx5_3 --sms 64
+```
+
+Add `--timeout-smoke-test` to verify the device-side deadline, poisoned-group
+behavior, fresh-QP reconfiguration, and exact recovery. With at least three
+ranks, `--shrink-smoke-test` also removes the last rank and verifies the
+survivor ring.
+
 ## Feature coverage
 
 | Area | Supported |
@@ -288,6 +358,7 @@ NIC should also have a GPUDirect-friendly PCIe path for useful performance.
 | Connection helpers | ✅ `QPInfo`, `local_qp_info`, `connect_rc` |
 | RDMA connection manager | ✅ `CMID.resolve/create_qp/connect/disconnect` |
 | GPU-initiated mlx5 data path | ✅ optional DOCA GPUNetIO bridge for Triton / CuTe DSL |
+| Optional GPU collectives | ✅ fault-tolerant `ibverbs.allreduce.ProcessGroup` (`SUM`) |
 
 Out of scope for v1 (candidates for later): the extended `ibv_wr_*` / `qp_ex`
 post API, device memory (`ibv_alloc_dm`), memory windows, and flow steering.

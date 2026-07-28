@@ -23,6 +23,13 @@ CUDA
    :members:
    :undoc-members:
 
+Optional all-reduce
+-------------------
+
+.. automodule:: ibverbs.allreduce
+   :members:
+   :undoc-members:
+
 Enums
 -----
 

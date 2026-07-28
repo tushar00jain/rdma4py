@@ -40,6 +40,18 @@ def put(qp, remote_addr, rkey, local_addr, lkey, length, _semantic=None):
 
 
 @core.extern
+def put_imm(qp, remote_addr, rkey, local_addr, lkey, length, immediate, _semantic=None):
+    """Post an RDMA Write with Immediate and return its send-CQ ticket."""
+    return _call(
+        "rdma4py_gpunetio_put_imm",
+        [qp, remote_addr, rkey, local_addr, lkey, length, immediate],
+        [_U64, _U64, _U32, _U64, _U32, _U64, _U32],
+        _U64,
+        _semantic,
+    )
+
+
+@core.extern
 def get(qp, remote_addr, rkey, local_addr, lkey, length, _semantic=None):
     """Post an RDMA Read and return its send-CQ ticket (Hopper or newer)."""
     return _call(
@@ -151,6 +163,7 @@ __all__ = [
     "get",
     "get_mcst",
     "put",
+    "put_imm",
     "recv",
     "send",
     "test_recv",

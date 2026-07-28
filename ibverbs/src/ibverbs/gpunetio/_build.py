@@ -119,7 +119,6 @@ def build_bitcode(
         "-std=gnu++17",
         "-O3",
         "-fno-exceptions",
-        "-fgpu-flush-denormals-to-zero",
         "-emit-llvm",
         "-c",
         str(source),
