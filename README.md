@@ -66,6 +66,13 @@ pip install nvmeof
 See [`nvmeof/README.md`](nvmeof/README.md) for target requirements, host and
 GPU examples, ordering rules, and current protocol scope.
 
+## [`experiments/`](experiments/) — research prototypes
+
+Experimental code is kept outside the installable packages. The
+[fault-tolerant GPUNetIO all-reduce](experiments/fault_tolerant_allreduce/)
+implements a PyTorch-nightly `ProcessGroup`, timeout recovery, dynamic
+membership, and exact-byte NCCL comparison on top of `ibverbs`.
+
 ## License
 
 BSD-3-Clause. See [LICENSE](LICENSE).

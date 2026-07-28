@@ -31,7 +31,6 @@ test = ["pytest>=7", "numpy"]
 gpu = ["torch"]
 gpunetio-triton = ["triton>=3.2"]
 gpunetio-cutedsl = ["nvidia-cutlass-dsl>=4.6"]
-allreduce = ["nvidia-cutlass-dsl>=4.6.1"]
 
 [project.urls]
 Documentation = "https://d4l3k.github.io/rdma4py/ibverbs/"

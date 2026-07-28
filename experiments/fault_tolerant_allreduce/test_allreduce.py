@@ -1,13 +1,18 @@
+# pyre-ignore-all-errors[21]: Optional test dependencies and experiment package.
 """Hardware-independent tests for the optional all-reduce control plane."""
 
 from __future__ import annotations
 
 import socket
-import time
+from datetime import timedelta
+from types import SimpleNamespace
 
 import pytest
 
-from ibverbs import allreduce
+torch = pytest.importorskip("torch")
+dist = pytest.importorskip("torch.distributed")
+
+from experiments.fault_tolerant_allreduce import allreduce  # noqa: E402
 
 
 def _payload(**overrides):
@@ -23,7 +28,6 @@ def _payload(**overrides):
         "max_bytes": 1 << 20,
         "qps": 8,
         "num_sms": 32,
-        "transport": "gpunetio",
     }
     value.update(overrides)
     return value
@@ -35,7 +39,6 @@ def test_reconfigure_handle_round_trip_and_validation():
     assert member.stable_rank == 7
     assert member.host == "rank7.example"
     assert member.qps == 8
-    assert member.transport == "gpunetio"
 
     with pytest.raises(allreduce.ReconfigureError, match="invalid"):
         allreduce._decode_handle("not-an-allreduce-handle")
@@ -56,7 +59,6 @@ def test_reconfigure_handle_round_trip_and_validation():
         {"max_bytes": 0},
         {"qps": 0},
         {"num_sms": 0},
-        {"transport": "nvlink"},
     ],
 )
 def test_reconfigure_handle_rejects_invalid_fields(overrides):
@@ -118,15 +120,13 @@ def _bare_group(**overrides):
         "_used_uuids": set(),
         "qps": 8,
         "num_sms": 8,
-        "transport": "gpunetio",
         "max_bytes": 1 << 20,
         "queue_depth": 256,
         "timeout": 1.0,
-        "rank": -1,
-        "size": 0,
+        "_rank": -1,
+        "_size": 0,
         "uuid": None,
         "_failed": False,
-        "_sequence": 0,
         "_gpunetio": None,
         "_outgoing": [],
         "_incoming": [],
@@ -141,7 +141,6 @@ def _bare_group(**overrides):
             nonce="local",
             qps=group.qps,
             num_sms=group.num_sms,
-            transport=group.transport,
             max_bytes=group.max_bytes,
         )
     )
@@ -161,10 +160,77 @@ def _peer_handle(rank, **overrides):
 
 def test_single_rank_reconfigure_and_uuid_reuse():
     group = _bare_group()
-    assert group.reconfigure(41, [group._handle]).wait() == 0
-    assert (group.rank, group.size, group.uuid, group._failed) == (0, 1, 41, False)
+    assert group._reconfigure(41, [group._handle]).wait()
+    assert (group._rank, group._size, group.uuid, group._failed) == (
+        0,
+        1,
+        41,
+        False,
+    )
     with pytest.raises(allreduce.ReconfigureError, match="fresh uuid"):
-        group.reconfigure(41, [group._handle])
+        group._reconfigure(41, [group._handle])
+
+
+def test_identity_reconfigure_and_abort_recovery():
+    group = _bare_group()
+    group._reconfigure(51, [group._handle]).wait()
+    group._reconfigure(52, [group._handle]).wait()
+    assert (group._rank, group._size, group.uuid, group._failed) == (
+        0,
+        1,
+        52,
+        False,
+    )
+    group.abort()
+    assert (group._rank, group._size, group.uuid, group._failed) == (
+        -1,
+        0,
+        None,
+        True,
+    )
+    group._reconfigure(53, [group._handle]).wait()
+    assert (group._rank, group._size, group.uuid, group._failed) == (
+        0,
+        1,
+        53,
+        False,
+    )
+
+
+def test_nightly_process_group_reconfigure_contract():
+    group = _bare_group()
+    options = SimpleNamespace(
+        uuid=71,
+        handles=[group._handle],
+        timeout=timedelta(seconds=2),
+        hints={"test": "value"},
+    )
+
+    work = group.reconfigure(options)
+
+    assert issubclass(allreduce.ProcessGroup, dist.ProcessGroup)
+    assert isinstance(work, dist.Work)
+    assert work.wait()
+    assert group.supports_reconfigure
+    assert group.getRank() == 0
+    assert group.getSize() == 1
+    assert group.getBackendName() == "ibverbs"
+
+
+def test_process_group_options_and_registration():
+    with pytest.raises(ValueError, match="hca"):
+        allreduce.ProcessGroupOptions("")
+    with pytest.raises(ValueError, match="max_bytes"):
+        allreduce.ProcessGroupOptions("mlx5_0", max_bytes=0)
+
+    if not hasattr(torch._C._distributed_c10d, "ReconfigureOptions"):
+        with pytest.raises(RuntimeError, match="PyTorch nightly"):
+            allreduce.register_backend("ibverbs_test_backend")
+    else:
+        name = "ibverbs_test_backend"
+        assert allreduce.register_backend(name) == name
+        assert dist.is_backend_available(name)
+        assert allreduce.register_backend(name) == name
 
 
 @pytest.mark.parametrize(
@@ -178,16 +244,16 @@ def test_reconfigure_rejects_bad_membership_shape(handles, message):
     group = _bare_group()
     values = [group._handle if value == "local" else value for value in handles]
     with pytest.raises(allreduce.ReconfigureError, match=message):
-        group.reconfigure(1, values)
+        group._reconfigure(1, values)
 
 
 def test_reconfigure_rejects_missing_local_and_duplicate_stable_rank():
     group = _bare_group()
     with pytest.raises(allreduce.ReconfigureError, match="local handle"):
-        group.reconfigure(1, [_peer_handle(1, qps=8, num_sms=8)])
+        group._reconfigure(1, [_peer_handle(1, qps=8, num_sms=8)])
     duplicate_rank = _peer_handle(0, qps=8, num_sms=8)
     with pytest.raises(allreduce.ReconfigureError, match="stable ranks"):
-        group.reconfigure(2, [group._handle, duplicate_rank])
+        group._reconfigure(2, [group._handle, duplicate_rank])
 
 
 @pytest.mark.parametrize(
@@ -195,62 +261,13 @@ def test_reconfigure_rejects_missing_local_and_duplicate_stable_rank():
     [
         ({"qps": 9, "num_sms": 8}, "qps and num_sms"),
         ({"qps": 8, "num_sms": 9}, "qps and num_sms"),
-        ({"qps": 8, "num_sms": 8, "transport": "host"}, "same transport"),
         ({"qps": 8, "num_sms": 8, "max_bytes": 2 << 20}, "capacities"),
     ],
 )
 def test_reconfigure_rejects_incompatible_members(overrides, message):
     group = _bare_group()
     with pytest.raises(allreduce.ReconfigureError, match=message):
-        group.reconfigure(1, [group._handle, _peer_handle(1, **overrides)])
-
-
-def test_nccl_segments_follow_ring_chunks_and_cover_channel():
-    count = 32768
-    itemsize = 4
-    world = 4
-    sms = 1
-    by_owner = [
-        allreduce._nccl_segments(count, itemsize, world, owner, sms)
-        for owner in range(world)
-    ]
-    flattened = sorted(piece for ranges in by_owner for piece in ranges)
-    assert flattened[0][0] == 0
-    assert sum(length for _, length in flattened) == count * itemsize
-    for (offset, length), (next_offset, _) in zip(flattened, flattened[1:]):
-        assert offset + length == next_offset
-
-
-def test_nccl_segments_repeat_chunk_ownership_for_large_channels():
-    # More than one 2 MiB * world loop exercises NCCL's elemOffset behavior.
-    count = (2 * 1024 * 1024 // 4) * 5
-    ranges = allreduce._nccl_segments(count, 4, 2, 1, 1)
-    assert len(ranges) == 3
-    assert all(length <= 2 * 1024 * 1024 for _, length in ranges)
-
-
-def test_nccl_segments_exhaustively_partition_scheduler_boundaries():
-    counts = [1, 3, 4095, 4096, 8191, 8192, 8193, 16384, 262147]
-    for itemsize in (1, 2, 4, 8):
-        for world in (1, 2, 3, 4, 7):
-            for sms in (1, 2, 8, 32):
-                for count in counts:
-                    pieces = sorted(
-                        piece
-                        for owner in range(world)
-                        for piece in allreduce._nccl_segments(
-                            count, itemsize, world, owner, sms
-                        )
-                    )
-                    assert sum(length for _, length in pieces) == count * itemsize
-                    assert pieces[0][0] == 0
-                    assert pieces[-1][0] + pieces[-1][1] == count * itemsize
-                    for (offset, length), (next_offset, _) in zip(pieces, pieces[1:]):
-                        assert offset + length == next_offset
-                    assert all(
-                        offset % itemsize == 0 and length % itemsize == 0
-                        for offset, length in pieces
-                    )
+        group._reconfigure(1, [group._handle, _peer_handle(1, **overrides)])
 
 
 @pytest.mark.parametrize(
@@ -262,61 +279,15 @@ def test_nccl_ring_simple_dynamic_channel_count(nbytes, channels):
     assert active == channels
 
 
-def test_stripe_segments_preserves_exact_coverage():
-    ranges = [(0, 4096), (8192, 2048)]
-    striped = allreduce._stripe_segments(ranges, lanes=8, alignment=4)
-    pieces = sorted(piece for lane in striped.values() for piece in lane)
-    assert sum(length for _, length in pieces) == 6144
-    for start, length in pieces:
-        assert start % 4 == 0
-        assert length % 4 == 0
-    for offset, length in ranges:
-        covered = [
-            (start, size) for start, size in pieces if offset <= start < offset + length
-        ]
-        assert covered[0][0] == offset
-        assert sum(size for _, size in covered) == length
-
-
 def test_completed_work_surface():
     work = allreduce.Work(3)
     assert work.is_completed()
     assert work.is_success()
-    assert work.wait() == 3
+    assert work.wait()
+    assert work.result() == 3
+    assert work.get_future().wait() == 3
     assert work.exception() is None
-
-    error = RuntimeError("failed")
-    failed = allreduce.Work(exception=error)
-    assert not failed.is_success()
-    with pytest.raises(RuntimeError, match="failed"):
-        failed.wait()
-
-
-class _EmptyCQ:
-    def poll(self, count):
-        assert count == 1
-        return []
-
-
-def test_completion_poll_has_native_deadline():
-    with pytest.raises(allreduce.AllReduceTimeoutError, match="test completion"):
-        allreduce._poll_one(_EmptyCQ(), time.monotonic() - 1, "test completion")
-
-
-def test_completion_poll_propagates_verbs_failure():
-    class Completion:
-        @staticmethod
-        def raise_for_status():
-            raise RuntimeError("work completion failed")
-
-    class FailedCQ:
-        @staticmethod
-        def poll(count):
-            assert count == 1
-            return [Completion()]
-
-    with pytest.raises(RuntimeError, match="work completion failed"):
-        allreduce._poll_one(FailedCQ(), time.monotonic() + 1, "failed completion")
+    assert isinstance(work, dist.Work)
 
 
 @pytest.mark.parametrize("value", [0, -1, float("inf"), float("nan")])
@@ -494,7 +465,6 @@ def _fake_data_group(status_value):
         },
     )()
     group = allreduce.ProcessGroup.__new__(allreduce.ProcessGroup)
-    group.transport = "gpunetio"
     group.work_buffer = _FakeTensor()
     group.scratch_buffer = type("Scratch", (), {"data_ptr": lambda self: 0x2000})()
     group._work_mr = type("WorkMR", (), {"lkey": 8})()
@@ -511,24 +481,46 @@ def _fake_data_group(status_value):
     group._closed = False
     group._failed = False
     group.uuid = 1
-    group.size = 2
-    group.rank = 0
+    group._size = 2
+    group._rank = 0
     group.max_bytes = 16
     group.timeout = 1.0
     group.num_sms = 1
-    group._sequence = 0
     return group
 
 
-def test_gpunetio_timeout_marks_group_failed(monkeypatch):
-    group = _fake_data_group(-110)
+def test_gpunetio_timeout_then_reconfigure_recovers(monkeypatch):
+    data_group = _fake_data_group(-110)
+    group = _bare_group(qps=1, num_sms=1)
+    for name in (
+        "work_buffer",
+        "scratch_buffer",
+        "_work_mr",
+        "_gpunetio",
+        "_gpunetio_kernels",
+        "_next_buffers",
+        "timeout",
+        "uuid",
+        "_rank",
+        "_size",
+    ):
+        setattr(group, name, getattr(data_group, name))
     monkeypatch.setattr(allreduce._ibcuda, "synchronize", lambda: None)
 
     with pytest.raises(allreduce.AllReduceTimeoutError, match="GPUNetIO"):
-        group.allreduce(_FakeTensor())
+        group._allreduce_tensor(_FakeTensor())
     assert group._failed
     with pytest.raises(allreduce.AllReduceError, match="failed"):
-        group.allreduce(_FakeTensor())
+        group._allreduce_tensor(_FakeTensor())
+
+    options = SimpleNamespace(
+        uuid=2,
+        handles=[group.get_reconfigure_handle()],
+        timeout=timedelta(seconds=1),
+        hints=None,
+    )
+    assert group.reconfigure(options).wait()
+    assert (group.getRank(), group.getSize(), group._failed) == (0, 1, False)
 
 
 def test_gpunetio_verbs_error_marks_group_failed(monkeypatch):
@@ -536,15 +528,17 @@ def test_gpunetio_verbs_error_marks_group_failed(monkeypatch):
     monkeypatch.setattr(allreduce._ibcuda, "synchronize", lambda: None)
 
     with pytest.raises(allreduce.AllReduceError, match="DOCA status -5"):
-        group.allreduce(_FakeTensor())
+        group._allreduce_tensor(_FakeTensor())
     assert group._failed
 
 
-def test_gpunetio_success_advances_sequence(monkeypatch):
+def test_gpunetio_success(monkeypatch):
     group = _fake_data_group(0)
     monkeypatch.setattr(allreduce._ibcuda, "synchronize", lambda: None)
 
     tensor = _FakeTensor()
-    assert group.allreduce(tensor) is tensor
-    assert group._sequence == 1
+    options = torch._C._distributed_c10d.AllreduceOptions()
+    work = group.allreduce([tensor], options)
+    assert work.wait()
+    assert work.result() == [tensor]
     assert not group._failed

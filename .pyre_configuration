@@ -8,6 +8,7 @@
   "site_package_search_strategy": "all",
   "source_directories": [
     "efa/src",
+    "experiments",
     "ibverbs/src",
     "nvmeof/src"
   ],

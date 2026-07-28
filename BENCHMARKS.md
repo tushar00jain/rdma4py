@@ -8,6 +8,7 @@ each backend's intended use:
 | EFA | 4 physical lanes, 4 QPs per lane, depth 16 | 1 QP, depth 1 | [EFA benchmarks](efa/BENCHMARKS.md) |
 | ibverbs | 16 RC QPs, depth 64 | 1 RC QP, serialized | [ibverbs benchmarks](ibverbs/BENCHMARKS.md) |
 | NVMe-oF/RDMA | 64 QPs through 1 MiB; 32 QPs, depth 4 above MDTS | 1 I/O QP, serialized logical transfer | [NVMe-oF benchmarks](nvmeof/BENCHMARKS.md) |
+| Experimental all-reduce | 64 GPUNetIO QPs / CuTe CTAs | Same channel count, Ring/Simple | [fault-tolerant all-reduce](experiments/fault_tolerant_allreduce/) |
 
 ![Bandwidth by message size](benchmarks/bandwidth.svg)
 

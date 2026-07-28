@@ -1,3 +1,4 @@
+# pyre-ignore-all-errors[21]: Optional test dependencies.
 """Opt-in multi-GPU correctness and fault-recovery tests for all-reduce.
 
 Set ``RDMA4PY_ALLREDUCE_GPUS`` and ``RDMA4PY_ALLREDUCE_HCAS`` to matching
@@ -11,11 +12,19 @@ import json
 import os
 import subprocess
 import sys
-from pathlib import Path
 
 import pytest
 
-pytestmark = [pytest.mark.integration, pytest.mark.gpu]
+torch = pytest.importorskip("torch")
+
+pytestmark = [
+    pytest.mark.integration,
+    pytest.mark.gpu,
+    pytest.mark.skipif(
+        not hasattr(torch._C._distributed_c10d, "ReconfigureOptions"),
+        reason="fault-tolerant all-reduce requires PyTorch nightly reconfiguration APIs",
+    ),
+]
 
 
 def _mapping():
@@ -39,14 +48,14 @@ def _run(extra, *, ranks=None):
     if ranks is not None:
         gpus = gpus[:ranks]
         hcas = hcas[:ranks]
-    benchmark = Path(__file__).parents[1] / "benchmarks" / "allreduce.py"
     command = [
         sys.executable,
         "-m",
         "torch.distributed.run",
         "--standalone",
         "--nproc-per-node=%d" % len(gpus),
-        str(benchmark),
+        "--module",
+        "experiments.fault_tolerant_allreduce.benchmark",
         "--gpus",
         ",".join(gpus),
         "--hcas",
@@ -82,20 +91,29 @@ def _run(extra, *, ranks=None):
     return json.loads(completed.stdout[start:])
 
 
-def test_nccl_edge_matrix_timeout_and_same_membership_recovery():
-    """Check exact bytes, timeout poisoning, and recovery on fresh QPs."""
+def test_timeout_then_reconfigure_and_exact_allreduce():
+    """Time out, reject reuse, reconfigure fresh QPs, and verify exact bytes."""
 
     gpus, _ = _mapping()
     if len(gpus) < 2:
         pytest.skip("all-reduce requires at least two GPU/HCA mappings")
-    result = _run(["--timeout-smoke-test"], ranks=2)
+    result = _run(
+        [
+            "--reconfigure-count",
+            "2",
+            "--timeout-smoke-test",
+            "--torch-process-group-smoke-test",
+        ],
+        ranks=2,
+    )
     assert result["timeout_recovery_test"] is True
+    assert result["torch_process_group_test"] is True
     assert result["dtype_parity"]
     assert all(entry["bit_exact"] for entry in result["dtype_parity"])
 
 
-def test_survivors_reconfigure_after_rank_removal():
-    """Drop one rank, rebuild the ring, and verify the survivor result."""
+def test_pytorch_fault_tolerance_membership_edges():
+    """Exercise shrink, merge, abort recovery, and dense rank reassignment."""
 
     gpus, _ = _mapping()
     if len(gpus) < 3:
@@ -110,3 +128,7 @@ def test_survivors_reconfigure_after_rank_removal():
         ]
     )
     assert result["shrink_reconfigure_test"] is True
+    assert result["merge_reconfigure_test"] is True
+    assert result["abort_reconfigure_test"] is True
+    assert result["middle_shrink_reconfigure_test"] is True
+    assert result["singleton_scale_reconfigure_test"] is True

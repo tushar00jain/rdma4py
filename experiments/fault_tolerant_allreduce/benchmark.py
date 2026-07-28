@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
+# pyre-ignore-all-errors[6, 21]: Optional benchmark dependencies and module path.
 """Compare the optional ibverbs/CuTe ring all-reduce with NCCL.
 
 Launch one process per GPU.  This benchmark intentionally configures NCCL for
 the Ring/Simple path, disables NVLink and shared-memory transports, fixes the
 same CTA/SM ceiling used by the CuTe kernels, and compares raw result bytes.
-NCCL is a benchmark/reference dependency only; ``ibverbs.allreduce`` never
-imports or calls it.
+NCCL is a benchmark/reference dependency only; the experiment implementation
+never imports or calls it.
 """
 
 from __future__ import annotations
@@ -17,7 +18,9 @@ import os
 import socket
 import statistics
 import time
+from datetime import timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 
 def _early_args():
@@ -42,14 +45,14 @@ if not _early.allow_nvlink_nccl:
     os.environ.setdefault("NCCL_SHM_DISABLE", "1")
     os.environ.setdefault("NCCL_NET", "IB")
 
-import ibverbs as ib  # noqa: E402
-from ibverbs.allreduce import (  # noqa: E402
+import torch  # noqa: E402
+import torch.distributed as dist  # noqa: E402
+from experiments.fault_tolerant_allreduce.allreduce import (  # noqa: E402
     AllReduceError,
     AllReduceTimeoutError,
     ProcessGroup,
+    ProcessGroupOptions,
 )
-import torch  # noqa: E402
-import torch.distributed as dist  # noqa: E402
 
 _DTYPES = {
     "float16": torch.float16,
@@ -157,31 +160,6 @@ class _NcclReference:
         if self.comm.value:
             self._check("ncclCommDestroy", self.lib.ncclCommDestroy(self.comm))
             self.comm = ctypes.c_void_p()
-
-
-def _find_gid(context, device_name: str, port: int):
-    base = "/sys/class/infiniband/%s/ports/%d/gid_attrs/types" % (
-        device_name,
-        port,
-    )
-    best = None
-    attrs = context.query_port(port)
-    for index in range(attrs.gid_tbl_len):
-        gid = context.query_gid(port, index)
-        if gid.raw == b"\0" * 16:
-            continue
-        try:
-            with open(os.path.join(base, str(index))) as stream:
-                gid_type = stream.read().strip().lower()
-        except OSError:
-            gid_type = ""
-        link_local = gid.raw[0] == 0xFE and (gid.raw[1] & 0xC0) == 0x80
-        score = (4 if "v2" in gid_type else 0) + (0 if link_local else 2)
-        if best is None or score > best[0]:
-            best = (score, index)
-    if best is None:
-        raise RuntimeError("no usable GID on %s port %d" % (device_name, port))
-    return best[1]
 
 
 def _parse_sizes(value: str):
@@ -314,6 +292,23 @@ def _max_across_ranks(value: float, device: int) -> float:
     return float(tensor.item())
 
 
+def _allreduce(group, tensor, timeout=None):
+    options = torch._C._distributed_c10d.AllreduceOptions()
+    if timeout is not None:
+        options.timeout = timedelta(seconds=timeout)
+    group.allreduce([tensor], options).wait()
+
+
+def _reconfigure(group, uuid, handles, timeout):
+    options = SimpleNamespace(
+        uuid=uuid,
+        handles=handles,
+        timeout=timedelta(seconds=timeout),
+        hints=None,
+    )
+    group.reconfigure(options).wait()
+
+
 def run(args):
     if not dist.is_available() or not torch.cuda.is_available():
         raise RuntimeError("CUDA torch.distributed is required for the benchmark")
@@ -329,49 +324,73 @@ def run(args):
     torch.cuda.set_device(gpu)
     nccl_reference = _NcclReference(rank, world)
 
-    devices = {device.name: device for device in ib.get_device_list()}
-    if hca not in devices:
-        raise RuntimeError("RDMA device not found: %s" % hca)
-    context = devices[hca].open()
-    pd = context.alloc_pd()
     capacity = max(max(args.sizes), max(args.parity_sizes))
-    work_buffer = torch.empty(capacity, dtype=torch.uint8, device=gpu)
-    scratch_buffer = torch.empty(capacity, dtype=torch.uint8, device=gpu)
-    gid_index = _find_gid(context, hca, args.port)
     local_world = int(os.environ.get("LOCAL_WORLD_SIZE", "1"))
     advertise_host = args.advertise_host or (
         "127.0.0.1" if local_world == world else socket.getfqdn()
     )
-    group = ProcessGroup(
-        context,
-        pd,
-        work_buffer,
-        scratch_buffer,
-        stable_rank=rank,
-        gid_index=gid_index,
+    options = ProcessGroupOptions(
+        hca=hca,
+        max_bytes=capacity,
+        gpu=gpu,
         port=args.port,
         advertise_host=advertise_host,
         qps=args.qps,
         num_sms=args.sms,
-        timeout=args.timeout,
         queue_depth=args.queue_depth,
-        transport=args.transport,
-        gpu=gpu,
         gpunetio_arch=args.gpunetio_arch,
         gpunetio_bitcode=args.gpunetio_bitcode,
         nic_handler=args.nic_handler,
+        stable_rank=rank,
     )
+    group = ProcessGroup.create(
+        dist.HashStore(),
+        rank,
+        world,
+        options,
+        timedelta(seconds=args.timeout),
+        initialize=False,
+        group_id="benchmark",
+    )
+    work_buffer = group.work_buffer
+    scratch_buffer = group.scratch_buffer
     handles = [None] * world
     dist.all_gather_object(handles, group.get_reconfigure_handle())
     for generation in range(args.reconfigure_count):
-        group.reconfigure(args.uuid + generation, handles, timeout=args.timeout).wait()
+        _reconfigure(group, args.uuid + generation, handles, args.timeout)
     dist.barrier()
 
     results = []
     parity = []
     timeout_recovery_verified = None
     shrink_verified = None
+    merge_verified = None
+    abort_recovery_verified = None
+    middle_shrink_verified = None
+    singleton_scale_verified = None
+    torch_process_group_verified = None
     try:
+        if args.torch_process_group_smoke_test:
+            pypg_count = (64 * 1024) // 4
+            original = _input(
+                pypg_count,
+                torch.float32,
+                gpu,
+                args.seed + rank + 50,
+                rank,
+            )
+            custom = work_buffer[: 64 * 1024].view(torch.float32)
+            custom.copy_(original)
+            reference = original.clone()
+            work = dist.all_reduce(custom, group=group, async_op=True)
+            work.wait()
+            nccl_reference.allreduce(reference, "float32")
+            mismatch = torch.tensor(_byte_mismatches(custom, reference), device=gpu)
+            dist.all_reduce(mismatch)
+            torch_process_group_verified = bool(mismatch.item() == 0)
+            if not torch_process_group_verified:
+                raise AssertionError("PyProcessGroup all-reduce differs from NCCL")
+
         # Compare storage bytes, not values: this catches NaN payload and
         # signed-zero differences as well as ordinary arithmetic mismatches.
         for name in args.parity_dtypes:
@@ -383,7 +402,7 @@ def run(args):
                 custom = work_buffer[: count * itemsize].view(dtype)
                 custom.copy_(original)
                 reference = original.clone()
-                group.allreduce(custom)
+                _allreduce(group, custom)
                 nccl_reference.allreduce(reference, name)
                 mismatches = _byte_mismatches(custom, reference)
                 mismatch_tensor = torch.tensor(mismatches, device=gpu)
@@ -470,7 +489,7 @@ def run(args):
         precondition = work_buffer[:precondition_bytes].view(torch.float32)
         precondition.zero_()
         for _ in range(args.precondition_iterations):
-            group.allreduce(precondition)
+            _allreduce(group, precondition)
         torch.cuda.synchronize(gpu)
 
         for size in args.sizes:
@@ -483,7 +502,7 @@ def run(args):
             # Correctness is tested before timing.  The NCCL environment above
             # fixes the ring, protocol, CTA count, and chunk size required for
             # a meaningful bitwise comparison.
-            group.allreduce(custom)
+            _allreduce(group, custom)
             dist.all_reduce(reference)
             torch.cuda.synchronize(gpu)
             mismatch = _byte_mismatches(custom, reference)
@@ -495,7 +514,7 @@ def run(args):
 
             def custom_call():
                 custom.copy_(original)
-                group.allreduce(custom)
+                _allreduce(group, custom)
 
             def nccl_call():
                 reference.copy_(original)
@@ -534,7 +553,7 @@ def run(args):
                 probe = work_buffer[: 64 * 1024].view(torch.float32)
                 probe.zero_()
                 try:
-                    group.allreduce(probe, timeout=args.timeout_smoke_seconds)
+                    _allreduce(group, probe, timeout=args.timeout_smoke_seconds)
                 except AllReduceTimeoutError:
                     pass
                 else:
@@ -550,7 +569,7 @@ def run(args):
 
             if rank == 0:
                 try:
-                    group.allreduce(probe)
+                    _allreduce(group, probe)
                 except AllReduceError:
                     pass
                 else:
@@ -558,7 +577,7 @@ def run(args):
             dist.barrier()
 
             recovery_uuid = args.uuid + args.reconfigure_count
-            group.reconfigure(recovery_uuid, handles, timeout=args.timeout).wait()
+            _reconfigure(group, recovery_uuid, handles, args.timeout)
             recovery_count = (64 * 1024) // 4
             original = _input(
                 recovery_count, torch.float32, gpu, args.seed + rank + 101, rank
@@ -566,7 +585,7 @@ def run(args):
             custom = work_buffer[: 64 * 1024].view(torch.float32)
             custom.copy_(original)
             reference = original.clone()
-            group.allreduce(custom)
+            _allreduce(group, custom)
             nccl_reference.allreduce(reference, "float32")
             recovery_mismatch = torch.tensor(
                 _byte_mismatches(custom, reference), device=gpu
@@ -586,16 +605,17 @@ def run(args):
             survivor_group = dist.new_group(ranks=survivor_ranks, backend="nccl")
             dist.barrier()
             local_shrink_verified = 1
+            shrink_count = (64 * 1024) // 4
             if rank < survivor_count:
                 generation_offset = args.reconfigure_count + int(
                     args.timeout_smoke_test
                 )
-                group.reconfigure(
+                _reconfigure(
+                    group,
                     args.uuid + generation_offset,
                     handles[:survivor_count],
-                    timeout=args.timeout,
-                ).wait()
-                shrink_count = (64 * 1024) // 4
+                    args.timeout,
+                )
                 original = _input(
                     shrink_count,
                     torch.float32,
@@ -606,7 +626,7 @@ def run(args):
                 custom = work_buffer[: 64 * 1024].view(torch.float32)
                 custom.copy_(original)
                 reference = original.clone()
-                group.allreduce(custom)
+                _allreduce(group, custom)
                 dist.all_reduce(reference, group=survivor_group)
                 torch.cuda.synchronize(gpu)
                 mismatch = torch.tensor(_byte_mismatches(custom, reference), device=gpu)
@@ -619,6 +639,125 @@ def run(args):
             if not shrink_verified:
                 raise AssertionError("survivor communicator failed after rank removal")
 
+            # Re-add the excluded rank. This is both a scale-up and late-join
+            # case: the survivors currently have a different ring generation.
+            generation = (
+                args.uuid + args.reconfigure_count + int(args.timeout_smoke_test) + 1
+            )
+            _reconfigure(group, generation, handles, args.timeout)
+            merge_count = (64 * 1024) // 4
+            original = _input(
+                merge_count,
+                torch.float32,
+                gpu,
+                args.seed + rank + 303,
+                rank,
+            )
+            custom = work_buffer[: 64 * 1024].view(torch.float32)
+            custom.copy_(original)
+            reference = original.clone()
+            _allreduce(group, custom)
+            nccl_reference.allreduce(reference, "float32")
+            mismatch = torch.tensor(_byte_mismatches(custom, reference), device=gpu)
+            dist.all_reduce(mismatch)
+            merge_verified = bool(mismatch.item() == 0)
+            if not merge_verified:
+                raise AssertionError("communicator failed after rank rejoined")
+
+            # PyTorch treats abort as a recoverable revoke in reconfigure mode.
+            group.abort()
+            _reconfigure(group, generation + 1, handles, args.timeout)
+            custom.copy_(original)
+            reference.copy_(original)
+            _allreduce(group, custom)
+            nccl_reference.allreduce(reference, "float32")
+            mismatch = torch.tensor(_byte_mismatches(custom, reference), device=gpu)
+            dist.all_reduce(mismatch)
+            abort_recovery_verified = bool(mismatch.item() == 0)
+            if not abort_recovery_verified:
+                raise AssertionError("communicator did not recover after abort")
+
+            # Drop a middle rank so at least one survivor's dense rank changes.
+            excluded_rank = world // 2
+            middle_survivors = [
+                candidate for candidate in range(world) if candidate != excluded_rank
+            ]
+            middle_handles = [handles[candidate] for candidate in middle_survivors]
+            middle_group = dist.new_group(ranks=middle_survivors, backend="nccl")
+            dist.barrier()
+            local_middle_verified = 1
+            if rank != excluded_rank:
+                _reconfigure(group, generation + 2, middle_handles, args.timeout)
+                original = _input(
+                    shrink_count,
+                    torch.float32,
+                    gpu,
+                    args.seed + rank + 404,
+                    rank,
+                )
+                custom.copy_(original)
+                reference = original.clone()
+                _allreduce(group, custom)
+                dist.all_reduce(reference, group=middle_group)
+                torch.cuda.synchronize(gpu)
+                mismatch = torch.tensor(_byte_mismatches(custom, reference), device=gpu)
+                dist.all_reduce(mismatch, group=middle_group)
+                local_middle_verified = int(mismatch.item() == 0)
+            dist.barrier()
+            verified_tensor = torch.tensor(local_middle_verified, device=gpu)
+            dist.all_reduce(verified_tensor, op=dist.ReduceOp.MIN)
+            middle_shrink_verified = bool(verified_tensor.item())
+            if not middle_shrink_verified:
+                raise AssertionError("middle-rank shrink changed the allreduce result")
+
+            # Match c10d's scale-down/up edge: first merge the middle-rank
+            # survivors, then give every process a disjoint one-rank ring,
+            # and finally form the complete ring again.
+            _reconfigure(group, generation + 3, handles, args.timeout)
+            _reconfigure(
+                group,
+                generation + 4 + rank,
+                [handles[rank]],
+                args.timeout,
+            )
+            singleton = _input(
+                shrink_count,
+                torch.float32,
+                gpu,
+                args.seed + rank + 505,
+                rank,
+            )
+            custom.copy_(singleton)
+            _allreduce(group, custom)
+            local_singleton_verified = int(
+                group.rank() == 0
+                and group.size() == 1
+                and _byte_mismatches(custom, singleton) == 0
+            )
+            dist.barrier()
+            _reconfigure(
+                group,
+                generation + 4 + world,
+                handles,
+                args.timeout,
+            )
+            custom.copy_(singleton)
+            reference = singleton.clone()
+            _allreduce(group, custom)
+            nccl_reference.allreduce(reference, "float32")
+            mismatch = torch.tensor(
+                _byte_mismatches(custom, reference),
+                device=gpu,
+            )
+            dist.all_reduce(mismatch)
+            verified_tensor = torch.tensor(local_singleton_verified, device=gpu)
+            dist.all_reduce(verified_tensor, op=dist.ReduceOp.MIN)
+            singleton_scale_verified = bool(
+                verified_tensor.item() and mismatch.item() == 0
+            )
+            if not singleton_scale_verified:
+                raise AssertionError("singleton scale-down/up recovery failed")
+
         if rank == 0:
             print(
                 json.dumps(
@@ -626,7 +765,7 @@ def run(args):
                         "world_size": world,
                         "gpus": gpu_ids,
                         "hcas": hcas,
-                        "transport": args.transport,
+                        "transport": "gpunetio",
                         "qps": group.qps,
                         "sms_and_nccl_ctas": args.sms,
                         "nccl_nvlink_disabled": not args.allow_nvlink_nccl,
@@ -637,6 +776,11 @@ def run(args):
                         "dtype_parity": parity,
                         "timeout_recovery_test": timeout_recovery_verified,
                         "shrink_reconfigure_test": shrink_verified,
+                        "merge_reconfigure_test": merge_verified,
+                        "abort_reconfigure_test": abort_recovery_verified,
+                        "middle_shrink_reconfigure_test": middle_shrink_verified,
+                        "singleton_scale_reconfigure_test": singleton_scale_verified,
+                        "torch_process_group_test": torch_process_group_verified,
                         "results": results,
                     },
                     indent=2,
@@ -646,8 +790,6 @@ def run(args):
             )
     finally:
         group.close()
-        pd.close()
-        context.close()
         nccl_reference.close()
         dist.destroy_process_group()
 
@@ -663,7 +805,7 @@ def main():
     parser.add_argument(
         "--qps",
         type=int,
-        help="QPs per direction (default: one per SM for GPUNetIO, 4 for host)",
+        help="QPs per direction (default: one per CuTe channel)",
     )
     parser.add_argument("--sms", type=int, default=32)
     parser.add_argument("--queue-depth", type=int, default=256)
@@ -675,7 +817,6 @@ def main():
     parser.add_argument("--uuid", type=int, default=1)
     parser.add_argument("--reconfigure-count", type=int, default=1)
     parser.add_argument("--advertise-host")
-    parser.add_argument("--transport", choices=("gpunetio", "host"), default="gpunetio")
     parser.add_argument("--gpunetio-arch", default="sm_90")
     parser.add_argument("--gpunetio-bitcode")
     parser.add_argument("--nic-handler", choices=("gpu", "auto", "cpu"), default="gpu")
@@ -698,6 +839,7 @@ def main():
     parser.add_argument("--timeout-smoke-test", action="store_true")
     parser.add_argument("--timeout-smoke-seconds", type=float, default=0.05)
     parser.add_argument("--shrink-smoke-test", action="store_true")
+    parser.add_argument("--torch-process-group-smoke-test", action="store_true")
     args = parser.parse_args()
     if (
         (args.qps is not None and args.qps <= 0)

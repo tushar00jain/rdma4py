@@ -1,10 +1,10 @@
+# pyre-ignore-all-errors[11]: CuTe scalar objects are runtime annotations.
 """Optional fault-tolerant CUDA all-reduce over RC ibverbs queue pairs.
 
-This module deliberately is not imported by :mod:`ibverbs`.  It adds no
-dependency to the base package: importing it needs only the standard library,
-and CuTe DSL is loaded lazily when :meth:`ProcessGroup.allreduce` is first
-called.  The transport uses GPUDirect RDMA only; it never uses CUDA IPC,
-NVLink, or NCCL.
+This module deliberately is not imported by :mod:`ibverbs`. It requires a
+PyTorch nightly with the Python ProcessGroup and reconfiguration APIs. CuTe DSL
+is loaded lazily when :meth:`ProcessGroup.allreduce` is first called. The
+transport uses GPUDirect RDMA only; it never uses CUDA IPC, NVLink, or NCCL.
 
 The implementation is one process per CUDA device.  Each process supplies two
 VMM-backed CUDA byte buffers (``work_buffer`` and ``scratch_buffer``), exchanges
@@ -26,19 +26,24 @@ import base64
 import ctypes
 import json
 import math
+import os
 import select
 import socket
 import struct
 import time
 import uuid as uuid_module
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import timedelta
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
-from . import _ibverbs as _ib
-from . import cuda as _ibcuda
-from .enums import AccessFlags, SendFlags, WROpcode
-from .helpers import QPInfo, connect_rc, local_qp_info
+import torch  # pyre-ignore[21]: Optional nightly dependency.
+import torch.distributed as dist  # pyre-ignore[21]: Optional nightly dependency.
+from ibverbs import (  # pyre-ignore[21]: Implemented by the Cython extension.
+    _ibverbs as _ib,
+    cuda as _ibcuda,
+)
+from ibverbs.enums import AccessFlags
+from ibverbs.helpers import connect_rc, local_qp_info, QPInfo
 
 _HANDLE_PREFIX = "ibverbs-allreduce-v1:"
 _FRAME = struct.Struct("!I")
@@ -68,6 +73,15 @@ _GPUNETIO_DTYPE_CODES = {
 _MAX_FRAME = 16 * 1024 * 1024
 
 
+def _require_torch_nightly() -> None:
+    c10d = torch._C._distributed_c10d
+    if not hasattr(c10d, "ReconfigureOptions"):
+        raise RuntimeError(
+            "fault_tolerant_allreduce requires a PyTorch nightly with c10d "
+            "ReconfigureOptions support"
+        )
+
+
 class AllReduceError(RuntimeError):
     """Base class for communicator and collective failures."""
 
@@ -80,17 +94,18 @@ class ReconfigureError(AllReduceError):
     """A membership handle or ring reconstruction was invalid."""
 
 
-class Work:
-    """A c10d-like completed work handle returned by ``reconfigure``.
+class Work(dist.Work):
+    """Completed nightly c10d work for synchronous GPUNetIO operations.
 
-    Reconfiguration is performed synchronously so that verbs resources cannot
-    become visible half-connected.  The returned object still offers the small
-    ``Work`` surface useful to callers shared with c10d code.
+    Reconfiguration and all-reduce finish before this object is returned. The
+    object still implements the PyProcessGroup trampoline's ``Work`` contract.
     """
 
-    def __init__(self, result: Any = None, exception: Optional[BaseException] = None):
+    def __init__(self, result: Any = None):
+        super().__init__()
         self._result = result
-        self._exception = exception
+        self._future = torch.futures.Future()
+        self._future.set_result(result)
 
     def is_completed(self) -> bool:
         """Return ``True``; reconfiguration finishes before this is returned."""
@@ -98,25 +113,29 @@ class Work:
         return True
 
     def is_success(self) -> bool:
-        """Return whether the synchronous operation completed successfully."""
+        """Return ``True`` because failures are raised synchronously."""
 
-        return self._exception is None
+        return True
 
-    def exception(self) -> Optional[BaseException]:
-        """Return the captured exception, if any."""
+    def exception(self) -> None:
+        """Return ``None`` because failures are raised synchronously."""
 
-        return self._exception
+        return None
 
-    def wait(self, timeout: Optional[Any] = None) -> Any:
-        """Return the result or re-raise the operation failure.
-
-        ``timeout`` is accepted for API compatibility.  The work is already
-        complete, so it never blocks.
-        """
+    def wait(self, timeout: Optional[timedelta] = None) -> bool:
+        """Return ``True`` because the operation has already completed."""
 
         del timeout
-        if self._exception is not None:
-            raise self._exception
+        return True
+
+    def get_future(self) -> torch.futures.Future:
+        """Return an already-completed c10d future."""
+
+        return self._future
+
+    def result(self) -> Any:
+        """Return the completed operation result."""
+
         return self._result
 
 
@@ -134,7 +153,6 @@ class _Member:
     max_bytes: int
     qps: int
     num_sms: int
-    transport: str
 
 
 @dataclass
@@ -329,7 +347,6 @@ def _decode_handle(handle: str) -> _Member:
             "max_bytes",
             "qps",
             "num_sms",
-            "transport",
         }
         if not isinstance(value, dict) or set(value) != required:
             raise ValueError("unexpected handle fields")
@@ -347,7 +364,6 @@ def _decode_handle(handle: str) -> _Member:
         or member.max_bytes <= 0
         or member.qps <= 0
         or member.num_sms <= 0
-        or member.transport not in {"gpunetio", "host"}
     ):
         raise ReconfigureError("invalid values in ibverbs all-reduce handle")
     try:
@@ -458,17 +474,6 @@ def _accept_member(
         sock.close()
 
 
-def _poll_one(cq: Any, deadline: float, what: str) -> Any:
-    while True:
-        completions = cq.poll(1)
-        if completions:
-            completion = completions[0]
-            completion.raise_for_status()
-            return completion
-        if time.monotonic() >= deadline:
-            raise AllReduceTimeoutError("timed out waiting for %s" % what)
-
-
 def _check_deadline(deadline: float, what: str = "all-reduce") -> None:
     if time.monotonic() >= deadline:
         raise AllReduceTimeoutError("%s exceeded its timeout" % what)
@@ -572,77 +577,8 @@ def _nccl_channel_layout(
     return cell_elements, per_channel, active
 
 
-def _nccl_segments(
-    count: int,
-    itemsize: int,
-    world_size: int,
-    chunk_index: int,
-    num_sms: int,
-) -> List[Tuple[int, int]]:
-    """Return byte ranges for one NCCL Ring/Simple rank chunk."""
-
-    if count <= 0:
-        return []
-    cell, cells_per_channel, active = _nccl_channel_layout(count, itemsize, num_sms)
-    base_chunk = max(1, _NCCL_SIMPLE_CHUNK_BYTES // itemsize)
-    alignment = max(1, 16 // itemsize)
-    ranges = []
-    owner = chunk_index % world_size
-    for channel in range(active):
-        channel_start = channel * cells_per_channel * cell
-        channel_count = min(count - channel_start, cells_per_channel * cell)
-        if channel_count <= 0:
-            continue
-        elem_offset = 0
-        chunk = base_chunk
-        while elem_offset < channel_count:
-            remaining = channel_count - elem_offset
-            if remaining < world_size * chunk:
-                chunk = (remaining + world_size - 1) // world_size
-                chunk = ((chunk + alignment - 1) // alignment) * alignment
-            local = owner * chunk
-            length = min(chunk, max(0, remaining - local))
-            if length:
-                start = channel_start + elem_offset + local
-                ranges.append((start * itemsize, length * itemsize))
-            elem_offset += world_size * chunk
-    return ranges
-
-
-def _stripe_segments(
-    ranges: Sequence[Tuple[int, int]], lanes: int, alignment: int
-) -> Dict[int, List[Tuple[int, int]]]:
-    """Split ranges over QPs while preserving non-overlapping byte coverage."""
-
-    striped = {lane: [] for lane in range(lanes)}
-    if len(ranges) >= lanes:
-        for index, piece in enumerate(ranges):
-            striped[index % lanes].append(piece)
-        return striped
-    if not ranges:
-        return {}
-
-    cursor = 0
-    lanes_per_range, extra_lanes = divmod(lanes, len(ranges))
-    for range_index, (offset, length) in enumerate(ranges):
-        if length % alignment:
-            raise ValueError("range length must be a multiple of alignment")
-        units = length // alignment
-        desired = lanes_per_range + (range_index < extra_lanes)
-        piece_count = min(desired, units)
-        position = offset
-        base_units, extra = divmod(units, piece_count)
-        for piece_index in range(piece_count):
-            piece = (base_units + (piece_index < extra)) * alignment
-            lane = cursor % lanes
-            striped[lane].append((position, piece))
-            cursor += 1
-            position += piece
-    return {lane: pieces for lane, pieces in striped.items() if pieces}
-
-
-class _CuteKernels:
-    """Lazily JIT-compiled CuTe copy and NCCL-ordered reduction kernels."""
+class _CuteCopyKernels:
+    """Lazily JIT-compiled CuTe staging-copy kernels."""
 
     _CUTLASS_TYPES = {
         "float16": "Float16",
@@ -661,21 +597,23 @@ class _CuteKernels:
 
     def __init__(self, num_sms: int):
         self.num_sms = num_sms
-        self._compiled: Dict[str, Tuple[Any, Any, Any, Any, Any]] = {}
+        self._compiled: Dict[str, Tuple[Any, Any, Any, Any]] = {}
 
-    def _get(self, dtype_key: str, pointer: int) -> Tuple[Any, Any, Any, Any, Any]:
+    def _get(self, dtype_key: str, pointer: int) -> Tuple[Any, Any, Any, Any]:
         cached = self._compiled.get(dtype_key)
         if cached is not None:
             return cached
         try:
-            import cutlass
-            import cutlass.cute as cute
-            from cutlass.cute.runtime import make_ptr
+            import cutlass  # pyre-ignore[21]: Optional dependency.
+            import cutlass.cute as cute  # pyre-ignore[21]: Optional dependency.
+            from cutlass.cute.runtime import (  # pyre-ignore[21]: Optional dependency.
+                make_ptr,
+            )
         except ImportError as exc:
             raise RuntimeError(
                 "CuTe all-reduce requires Python 3.10+ and the optional "
                 "nvidia-cutlass-dsl package; install with "
-                "pip install './ibverbs[allreduce]'"
+                "pip install -e './ibverbs[gpunetio-cutedsl]'"
             ) from exc
 
         # ``from __future__ import annotations`` stores the nested JIT
@@ -706,100 +644,16 @@ class _CuteKernels:
             dst = cute.make_tensor(dst_ptr, cute.make_layout((count,)))
             copy_kernel(src, dst, count).launch(grid=[sms, 1, 1], block=[256, 1, 1])
 
-        @cute.kernel
-        def reduce_kernel(
-            work: cute.Tensor,
-            scratch: cute.Tensor,
-            count: cutlass.Int32,
-            world: cutlass.Int32,
-            owner: cutlass.Int32,
-            cell_elements: cutlass.Int32,
-            cells_per_channel: cutlass.Int32,
-            active_channels: cutlass.Int32,
-            base_chunk: cutlass.Int32,
-            align_elements: cutlass.Int32,
-        ):
-            tid, _, _ = cute.arch.thread_idx()
-            channel, _, _ = cute.arch.block_idx()
-            if channel < active_channels:
-                channel_start = (
-                    cutlass.Int32(channel) * cells_per_channel * cell_elements
-                )
-                channel_count = min(
-                    count - channel_start, cells_per_channel * cell_elements
-                )
-                loop_count = cutlass.Int32(world) * base_chunk
-                for elem_offset in cutlass.range(0, channel_count, loop_count):
-                    remaining = channel_count - elem_offset
-                    chunk = base_chunk
-                    if remaining < loop_count:
-                        chunk = (remaining + cutlass.Int32(world) - 1) // cutlass.Int32(
-                            world
-                        )
-                        chunk = (
-                            (chunk + align_elements - 1) // align_elements
-                        ) * align_elements
-                    local = cutlass.Int32(owner) * chunk
-                    length = min(chunk, max(cutlass.Int32(0), remaining - local))
-                    start = channel_start + elem_offset + local
-                    for i in cutlass.range(
-                        cutlass.Int32(tid), length, cutlass.Int32(256)
-                    ):
-                        index = start + i
-                        if index < count:
-                            work[index] = work[index] + scratch[index]
-
-        @cute.jit
-        def reduce_host(
-            work_ptr: cute.Pointer,
-            scratch_ptr: cute.Pointer,
-            count: cutlass.Int32,
-            world: cutlass.Int32,
-            owner: cutlass.Int32,
-            cell_elements: cutlass.Int32,
-            cells_per_channel: cutlass.Int32,
-            active_channels: cutlass.Int32,
-            base_chunk: cutlass.Int32,
-            align_elements: cutlass.Int32,
-        ):
-            work = cute.make_tensor(work_ptr, cute.make_layout((count,)))
-            scratch = cute.make_tensor(scratch_ptr, cute.make_layout((count,)))
-            reduce_kernel(
-                work,
-                scratch,
-                count,
-                world,
-                owner,
-                cell_elements,
-                cells_per_channel,
-                active_channels,
-                base_chunk,
-                align_elements,
-            ).launch(grid=[sms, 1, 1], block=[256, 1, 1])
-
         ptr = make_ptr(dtype, pointer, cute.AddressSpace.gmem, assumed_align=16)
         copy = cute.compile(copy_host, ptr, ptr, cutlass.Int32(1))
-        reduce = cute.compile(
-            reduce_host,
-            ptr,
-            ptr,
-            cutlass.Int32(1),
-            cutlass.Int32(2),
-            cutlass.Int32(0),
-            cutlass.Int32(1),
-            cutlass.Int32(1),
-            cutlass.Int32(1),
-            cutlass.Int32(1),
-            cutlass.Int32(1),
-        )
-        cached = (copy, reduce, make_ptr, dtype, cutlass)
+        cached = (copy, make_ptr, dtype, cutlass)
         self._compiled[dtype_key] = cached
         return cached
 
     def copy(self, source: int, destination: int, count: int, dtype_key: str) -> None:
         """Copy ``count`` elements with a fixed ``num_sms`` CTA launch."""
 
-        copy, _, make_ptr, dtype, cutlass = self._get(dtype_key, source)
+        copy, make_ptr, dtype, cutlass = self._get(dtype_key, source)
         src = make_ptr(dtype, source, self._address_space(make_ptr), assumed_align=16)
         dst = make_ptr(
             dtype, destination, self._address_space(make_ptr), assumed_align=16
@@ -813,41 +667,6 @@ class _CuteKernels:
         import cutlass.cute as cute
 
         return cute.AddressSpace.gmem
-
-    def reduce(
-        self,
-        work: int,
-        scratch: int,
-        count: int,
-        dtype_key: str,
-        itemsize: int,
-        world: int,
-        owner: int,
-    ) -> None:
-        """Reduce the selected NCCL ring chunks from scratch into work."""
-
-        _, reduce, make_ptr, dtype, cutlass = self._get(dtype_key, work)
-        ptr_work = make_ptr(
-            dtype, work, self._address_space(make_ptr), assumed_align=16
-        )
-        ptr_scratch = make_ptr(
-            dtype, scratch, self._address_space(make_ptr), assumed_align=16
-        )
-        cell, cells_per_channel, active = _nccl_channel_layout(
-            count, itemsize, self.num_sms
-        )
-        reduce(
-            ptr_work,
-            ptr_scratch,
-            cutlass.Int32(count),
-            cutlass.Int32(world),
-            cutlass.Int32(owner),
-            cutlass.Int32(cell),
-            cutlass.Int32(cells_per_channel),
-            cutlass.Int32(active),
-            cutlass.Int32(max(1, _NCCL_SIMPLE_CHUNK_BYTES // itemsize)),
-            cutlass.Int32(max(1, 16 // itemsize)),
-        )
 
 
 class _CuteGpuNetIOKernels:
@@ -901,7 +720,7 @@ class _CuteGpuNetIOKernels:
 
         globals()["cutlass"] = cutlass
         globals()["cute"] = cute
-        dtype = getattr(cutlass, _CuteKernels._CUTLASS_TYPES[dtype_key])
+        dtype = getattr(cutlass, _CuteCopyKernels._CUTLASS_TYPES[dtype_key])
         sms = self.num_sms
         qps = self.qps
         itemsize = dtype.width // 8
@@ -1250,27 +1069,94 @@ class _CuteGpuNetIOKernels:
         )
 
 
-class ProcessGroup:
-    """A reconfigurable, rank-ordered GPUDirect RDMA all-reduce group.
+def _timeout_value(value: Any) -> Optional[timedelta]:
+    if not isinstance(value, timedelta) or value.total_seconds() <= 0:
+        return None
+    return value
+
+
+def _find_device(name: str) -> Any:
+    for device in _ib.get_device_list():  # pyre-ignore[16]: Cython export.
+        if device.name == name:
+            return device
+    raise RuntimeError("RDMA device %r was not found" % name)
+
+
+def _find_gid_index(context: Any, device_name: str, port: int) -> int:
+    base = "/sys/class/infiniband/%s/ports/%d/gid_attrs/types" % (
+        device_name,
+        port,
+    )
+    best = None
+    attributes = context.query_port(port)
+    for index in range(attributes.gid_tbl_len):
+        gid = context.query_gid(port, index)
+        if gid.raw == b"\0" * 16:
+            continue
+        try:
+            with open(os.path.join(base, str(index))) as stream:
+                gid_type = stream.read().strip().lower()
+        except OSError:
+            gid_type = ""
+        link_local = gid.raw[0] == 0xFE and (gid.raw[1] & 0xC0) == 0x80
+        score = (4 if "v2" in gid_type else 0) + (0 if link_local else 2)
+        if best is None or score > best[0]:
+            best = (score, index)
+    if best is None:
+        raise RuntimeError("no usable GID on %s port %d" % (device_name, port))
+    return best[1]
+
+
+@dataclass
+class ProcessGroupOptions:
+    """Resources and GPUNetIO tuning for the nightly c10d backend."""
+
+    hca: str
+    max_bytes: int = 64 * 1024 * 1024
+    gpu: Optional[int] = None
+    gid_index: Optional[int] = None
+    port: int = 1
+    num_sms: int = 32
+    qps: Optional[int] = None
+    queue_depth: int = 256
+    advertise_host: Optional[str] = None
+    bind_host: str = "0.0.0.0"
+    rendezvous_port: int = 0
+    gpunetio_arch: str = "sm_90"
+    gpunetio_bitcode: Any = None
+    nic_handler: str = "gpu"
+    stable_rank: Optional[int] = None
+
+    def __post_init__(self) -> None:
+        if not self.hca:
+            raise ValueError("hca must name the GPU-local RDMA device")
+        if self.max_bytes <= 0:
+            raise ValueError("max_bytes must be positive")
+
+
+class ProcessGroup(dist.ProcessGroup):
+    """Nightly PyProcessGroup implementing rank-ordered GPUNetIO all-reduce.
 
     Args:
+        store: c10d store retained by the nightly PyProcessGroup trampoline.
+        rank: Initial c10d group rank.
+        size: Initial c10d group size.
         context: Open :class:`ibverbs.Context` for the GPU-local HCA.
         pd: Protection domain allocated from ``context``.
         work_buffer: Contiguous VMM-backed CUDA byte tensor used internally.
         scratch_buffer: A distinct buffer with at least the same capacity.
-        stable_rank: Stable application rank encoded in reconfigure handles.
+        stable_rank: Stable application rank encoded in reconfigure handles;
+            defaults to ``rank``.
         gid_index: Local GID index used to connect RC QPs.
         port: Active HCA port number.
         advertise_host: Address peers can use for the reconfigure rendezvous.
         bind_host: Local address for the rendezvous listener.
         rendezvous_port: Listener port, or zero for an ephemeral port.
-        qps: RC queue pairs used in parallel for each ring direction. By
-            default GPUNetIO uses one QP per channel and the host path uses 4.
+        qps: RC queue pairs used in parallel for each ring direction. The
+            default uses one QP per CuTe channel.
         num_sms: CuTe CTA count.  The benchmark forces NCCL to this same count.
         timeout: Default all-reduce and reconfiguration deadline.
         queue_depth: Maximum posted writes per QP in one ring round.
-        transport: ``"gpunetio"`` for a persistent GPU-posted ring or
-            ``"host"`` for the portable host-posted fallback.
         gpu: CUDA device index or PCI address exported through GPUNetIO. The
             default selects the current CUDA context.
         gpunetio_arch: CUDA architecture passed to the GPUNetIO bitcode build.
@@ -1284,16 +1170,19 @@ class ProcessGroup:
     before importing torch.
     """
 
-    supports_reconfigure = True
+    backend_name = "ibverbs"
 
     def __init__(
         self,
+        store: dist.Store,
+        rank: int,
+        size: int,
         context: Any,
         pd: Any,
         work_buffer: Any,
         scratch_buffer: Any,
         *,
-        stable_rank: int,
+        stable_rank: Optional[int] = None,
         gid_index: int,
         port: int = 1,
         advertise_host: Optional[str] = None,
@@ -1303,23 +1192,26 @@ class ProcessGroup:
         num_sms: int = 32,
         timeout: Any = 30.0,
         queue_depth: int = 256,
-        transport: str = "gpunetio",
         gpu: Any = None,
         gpunetio_arch: str = "sm_90",
         gpunetio_bitcode: Any = None,
         nic_handler: str = "gpu",
     ):
-        transport = str(transport).lower()
-        if transport not in {"gpunetio", "host"}:
-            raise ValueError("transport must be 'gpunetio' or 'host'")
+        _require_torch_nightly()
+        super().__init__(store, rank, size)  # pyre-ignore[19]
+        self._store = store
+        self._initial_rank = int(rank)
+        self._initial_size = int(size)
+        if stable_rank is None:
+            stable_rank = rank
         num_sms = int(num_sms)
         if qps is None:
-            qps = num_sms if transport == "gpunetio" else 4
+            qps = num_sms
         if int(stable_rank) < 0:
             raise ValueError("stable_rank must be non-negative")
         if int(qps) <= 0 or num_sms <= 0 or int(queue_depth) <= 0:
             raise ValueError("qps, num_sms, and queue_depth must be positive")
-        if transport == "gpunetio" and int(qps) < num_sms:
+        if int(qps) < num_sms:
             raise ValueError(
                 "GPUNetIO requires at least one QP per SM/channel; "
                 "set qps >= num_sms"
@@ -1344,16 +1236,14 @@ class ProcessGroup:
         self.num_sms = num_sms
         self.timeout = _seconds(timeout, 30.0)
         self.queue_depth = int(queue_depth)
-        self.transport = transport
         self.gpu = gpu
         self.gpunetio_arch = str(gpunetio_arch)
         self.gpunetio_bitcode = gpunetio_bitcode
         self.nic_handler = nic_handler
         self.max_bytes = work_bytes
-        self.rank = -1
-        self.size = 0
+        self._rank = -1
+        self._size = 0
         self.uuid: Optional[int] = None
-        self._sequence = 0
         self._failed = False
         self._closed = False
         self._outgoing: List[_Lane] = []
@@ -1361,7 +1251,7 @@ class ProcessGroup:
         self._next_buffers: Optional[Dict[str, int]] = None
         self._gpunetio: Optional[_GpuNetIOState] = None
         self._used_uuids = set()
-        self._kernels = _CuteKernels(self.num_sms)
+        self._kernels = _CuteCopyKernels(self.num_sms)
         self._gpunetio_kernels = _CuteGpuNetIOKernels(
             self.num_sms,
             self.qps,
@@ -1403,9 +1293,87 @@ class ProcessGroup:
                 "max_bytes": self.max_bytes,
                 "qps": self.qps,
                 "num_sms": self.num_sms,
-                "transport": self.transport,
             }
         )
+
+    @classmethod
+    def create(
+        cls,
+        store: dist.Store,
+        rank: int,
+        size: int,
+        options: ProcessGroupOptions,
+        timeout: timedelta,
+        *,
+        initialize: bool,
+        group_id: str,
+    ) -> "ProcessGroup":
+        """Allocate CUDA/RDMA resources and optionally form the initial ring."""
+
+        _require_torch_nightly()
+        gpu = torch.cuda.current_device() if options.gpu is None else int(options.gpu)
+        torch.cuda.set_device(gpu)
+        device = _find_device(options.hca)
+        context = device.open()
+        pd = context.alloc_pd()
+        try:
+            gid_index = options.gid_index
+            if gid_index is None:
+                gid_index = _find_gid_index(context, options.hca, options.port)
+            work = torch.empty(options.max_bytes, dtype=torch.uint8, device=gpu)
+            scratch = torch.empty(options.max_bytes, dtype=torch.uint8, device=gpu)
+            group = cls(
+                store,
+                rank,
+                size,
+                context,
+                pd,
+                work,
+                scratch,
+                stable_rank=options.stable_rank,
+                gid_index=gid_index,
+                port=options.port,
+                advertise_host=options.advertise_host,
+                bind_host=options.bind_host,
+                rendezvous_port=options.rendezvous_port,
+                qps=options.qps,
+                num_sms=options.num_sms,
+                timeout=timeout,
+                queue_depth=options.queue_depth,
+                gpu=gpu,
+                gpunetio_arch=options.gpunetio_arch,
+                gpunetio_bitcode=options.gpunetio_bitcode,
+                nic_handler=options.nic_handler,
+            )
+        except Exception:
+            pd.close()
+            context.close()
+            raise
+        try:
+            if initialize:
+                group._initialize(group_id, timeout)
+        except Exception:
+            group.close()
+            raise
+        return group
+
+    def _initialize(self, group_id: str, timeout: timedelta) -> None:
+        key_prefix = "ibverbs-initial-%s" % (group_id or "default")
+        self._store.set(
+            "%s/%d" % (key_prefix, self._initial_rank),
+            self.get_reconfigure_handle(),
+        )
+        handles = [
+            self._store.get("%s/%d" % (key_prefix, rank)).decode("utf-8")
+            for rank in range(self._initial_size)
+        ]
+        self._reconfigure(0, handles, timeout=timeout).wait()
+
+    @property
+    def supports_reconfigure(self) -> bool:
+        """Return ``True`` for nightly c10d fault-tolerance discovery."""
+
+        return True
 
     def get_reconfigure_handle(self) -> str:
         """Return this rank's opaque, out-of-band membership handle."""
@@ -1423,7 +1391,7 @@ class ProcessGroup:
                     cq = self.context.create_cq(self.queue_depth + 8)
                     try:
                         qp = self.pd.create_qp(
-                            _ib.QPInitAttr(
+                            _ib.QPInitAttr(  # pyre-ignore[16]: Cython export.
                                 send_cq=cq,
                                 recv_cq=cq,
                                 max_send_wr=self.queue_depth,
@@ -1463,7 +1431,7 @@ class ProcessGroup:
     ) -> _GpuNetIOState:
         """Transfer freshly connected QPs to the direct GPU data path."""
 
-        from .gpunetio import DeviceQP
+        from ibverbs.gpunetio import DeviceQP
 
         device_outgoing = []
         device_incoming = []
@@ -1539,7 +1507,19 @@ class ProcessGroup:
         self._incoming = []
         self._next_buffers = None
 
-    def reconfigure(
+    def reconfigure(self, opts: Any) -> Work:
+        """Consume nightly ``ReconfigureOptions`` and rebuild fresh QPs."""
+
+        work = self._reconfigure(
+            int(opts.uuid),
+            opts.handles,
+            timeout=_timeout_value(getattr(opts, "timeout", None)),
+            hints=getattr(opts, "hints", None),
+        )
+        work.wait()
+        return Work(None)
+
+    def _reconfigure(
         self,
         uuid: int,
         handles: Iterable[str],
@@ -1582,8 +1562,6 @@ class ProcessGroup:
         for member in members:
             if member.qps != self.qps or member.num_sms != self.num_sms:
                 raise ReconfigureError("all members must use identical qps and num_sms")
-            if member.transport != self.transport:
-                raise ReconfigureError("all members must use the same transport")
             if member.max_bytes != self.max_bytes:
                 raise ReconfigureError(
                     "all members must use identical staging-buffer capacities"
@@ -1594,15 +1572,14 @@ class ProcessGroup:
         deadline = time.monotonic() + _seconds(timeout, self.timeout)
         self._close_lanes()
         self._failed = True
-        self.rank = -1
-        self.size = 0
+        self._rank = -1
+        self._size = 0
         self.uuid = None
         if size == 1:
-            self.rank = 0
-            self.size = 1
+            self._rank = 0
+            self._size = 1
             self.uuid = uuid
             self._failed = False
-            self._sequence = 0
             self._used_uuids.add(uuid)
             return Work(0)
 
@@ -1681,8 +1658,7 @@ class ProcessGroup:
                 key: int(buffers[key])
                 for key in ("work_addr", "work_rkey", "scratch_addr", "scratch_rkey")
             }
-            if self.transport == "gpunetio":
-                gpunetio_state = self._export_gpunetio(outgoing, incoming)
+            gpunetio_state = self._export_gpunetio(outgoing, incoming)
         except Exception:
             if gpunetio_state is not None:
                 try:
@@ -1705,107 +1681,35 @@ class ProcessGroup:
         self._incoming = incoming
         self._next_buffers = next_buffers
         self._gpunetio = gpunetio_state
-        self.rank = rank
-        self.size = size
+        self._rank = rank
+        self._size = size
         self.uuid = uuid
         self._failed = False
-        self._sequence = 0
         self._used_uuids.add(uuid)
         return Work(rank)
 
-    def _notification(self, phase: int, round_index: int) -> int:
-        if round_index >= 0x4000:
-            raise AllReduceError("communicator is too large for notification encoding")
-        return (
-            ((self._sequence & 0xFFFF) << 16)
-            | ((phase & 0x3) << 14)
-            | (round_index & 0x3FFF)
+    def allreduce(self, tensors: Sequence[torch.Tensor], opts: Any) -> Work:
+        """Run an in-place SUM over the one tensor accepted by c10d."""
+
+        if len(tensors) != 1:
+            raise ValueError("ibverbs allreduce accepts exactly one tensor")
+        reduce_op = getattr(opts, "reduceOp", dist.ReduceOp.SUM)
+        if reduce_op != dist.ReduceOp.SUM:
+            raise NotImplementedError("ibverbs allreduce only supports SUM")
+        self._allreduce_tensor(
+            tensors[0], timeout=_timeout_value(getattr(opts, "timeout", None))
         )
+        return Work(list(tensors))
 
-    def _round(
-        self,
-        source_ranges: Sequence[Tuple[int, int]],
-        receive_ranges: Sequence[Tuple[int, int]],
-        destination: str,
-        notification: int,
-        deadline: float,
-        alignment: int,
-    ) -> None:
-        assert self._next_buffers is not None
-        send_stripes = _stripe_segments(source_ranges, self.qps, alignment)
-        recv_stripes = _stripe_segments(receive_ranges, self.qps, alignment)
-        if not send_stripes:
-            send_stripes = {0: []}
-        if not recv_stripes:
-            recv_stripes = {0: []}
-
-        for lane_index in recv_stripes:
-            self._incoming[lane_index].qp.post_recv(
-                _ib.RecvWR(wr_id=notification, sg_list=[])
-            )
-
-        remote_addr = self._next_buffers[destination + "_addr"]
-        remote_rkey = self._next_buffers[destination + "_rkey"]
-        for lane_index, pieces in send_stripes.items():
-            writes = []
-            if len(pieces) > self.queue_depth:
-                raise AllReduceError(
-                    "ring round exceeds queue_depth; increase queue_depth or reduce max_bytes"
-                )
-            for index, (offset, length) in enumerate(pieces):
-                last = index == len(pieces) - 1
-                writes.append(
-                    _ib.SendWR(
-                        wr_id=notification,
-                        sg_list=[self._work_mr.sge(length, offset=offset)],
-                        opcode=(
-                            WROpcode.RDMA_WRITE_WITH_IMM
-                            if last
-                            else WROpcode.RDMA_WRITE
-                        ),
-                        send_flags=SendFlags.SIGNALED if last else 0,
-                        remote_addr=remote_addr + offset,
-                        rkey=remote_rkey,
-                        imm_data=notification if last else 0,
-                    )
-                )
-            if not writes:
-                writes.append(
-                    _ib.SendWR(
-                        wr_id=notification,
-                        sg_list=[],
-                        opcode=WROpcode.RDMA_WRITE_WITH_IMM,
-                        send_flags=SendFlags.SIGNALED,
-                        remote_addr=remote_addr,
-                        rkey=remote_rkey,
-                        imm_data=notification,
-                    )
-                )
-            self._outgoing[lane_index].qp.post_send(writes)
-
-        for lane_index in send_stripes:
-            completion = _poll_one(
-                self._outgoing[lane_index].cq, deadline, "RDMA send completion"
-            )
-            if completion.wr_id != notification:
-                raise AllReduceError("stale send completion in all-reduce")
-        for lane_index in recv_stripes:
-            completion = _poll_one(
-                self._incoming[lane_index].cq, deadline, "RDMA receive notification"
-            )
-            if completion.imm_data != notification:
-                raise AllReduceError("stale receive notification in all-reduce")
-
-    def allreduce(
+    def _allreduce_tensor(
         self, tensor: Any, op: str = "sum", timeout: Optional[Any] = None
     ) -> Any:
         """All-reduce ``tensor`` in place and return it.
 
         The operation uses a rank-ordered Ring/Simple schedule and exactly
         ``num_sms`` CuTe CTAs. GPUNetIO posts and polls one QP per active CTA
-        from a single persistent kernel; the fallback stripes host-posted work
-        over ``qps`` QPs. ``timeout`` covers CUDA and verbs completion, and the
-        GPUNetIO completion loops enforce it directly on the GPU.
+        from a single persistent kernel. ``timeout`` covers CUDA and verbs
+        completion, and the completion loops enforce it directly on the GPU.
 
         A timeout or verbs error puts the group in a failed state.  Exchange a
         surviving set of handles and call :meth:`reconfigure` with a fresh UUID
@@ -1817,7 +1721,7 @@ class ProcessGroup:
             raise NotImplementedError("only SUM all-reduce is implemented")
         if self._closed:
             raise AllReduceError("process group is closed")
-        if self.uuid is None or self.size <= 0:
+        if self.uuid is None or self._size <= 0:
             raise AllReduceError("call reconfigure() before allreduce()")
         if self._failed:
             raise AllReduceError("process group failed; reconfigure it before reuse")
@@ -1844,119 +1748,102 @@ class ProcessGroup:
                 self._kernels.copy(tensor_ptr, work_ptr, count, dtype_key)
                 _ibcuda.synchronize()
                 _check_deadline(deadline)
-            if self.size == 1:
+            if self._size == 1:
                 if tensor_ptr != work_ptr:
                     self._kernels.copy(work_ptr, tensor_ptr, count, dtype_key)
                     _ibcuda.synchronize()
                     _check_deadline(deadline)
-                self._sequence += 1
                 return tensor
 
-            if self.transport == "gpunetio":
-                if self._gpunetio is None or self._next_buffers is None:
-                    raise AllReduceError("GPUNetIO communicator is not exported")
-                _check_deadline(deadline)
-                self._gpunetio.status.zero()
-                timeout_cycles = max(
-                    1,
-                    int((deadline - time.monotonic()) * self._gpunetio.clock_rate_hz),
+            gpunetio = self._gpunetio
+            next_buffers = self._next_buffers
+            if gpunetio is None or next_buffers is None:
+                raise AllReduceError("GPUNetIO communicator is not exported")
+            _check_deadline(deadline)
+            gpunetio.status.zero()
+            timeout_cycles = max(
+                1,
+                int((deadline - time.monotonic()) * gpunetio.clock_rate_hz),
+            )
+            self._gpunetio_kernels.allreduce(
+                outgoing_qps=gpunetio.outgoing_pointers.ptr,
+                incoming_qps=gpunetio.incoming_pointers.ptr,
+                status=gpunetio.status.ptr,
+                work=work_ptr,
+                scratch=scratch_ptr,
+                count=count,
+                dtype_key=dtype_key,
+                itemsize=itemsize,
+                rank=self._rank,
+                world=self._size,
+                remote_buffers=next_buffers,
+                work_lkey=self._work_mr.lkey,
+                signal_addr=gpunetio.signal_mr.addr,
+                signal_lkey=gpunetio.signal_mr.lkey,
+                timeout_cycles=timeout_cycles,
+            )
+            _ibcuda.synchronize()
+            statuses = gpunetio.status.read_i32(self.num_sms)
+            failed = next((value for value in statuses if value != 0), 0)
+            if failed == -110:
+                raise AllReduceTimeoutError(
+                    "timed out in the GPUNetIO all-reduce kernel"
                 )
-                self._gpunetio_kernels.allreduce(
-                    outgoing_qps=self._gpunetio.outgoing_pointers.ptr,
-                    incoming_qps=self._gpunetio.incoming_pointers.ptr,
-                    status=self._gpunetio.status.ptr,
-                    work=work_ptr,
-                    scratch=scratch_ptr,
-                    count=count,
-                    dtype_key=dtype_key,
-                    itemsize=itemsize,
-                    rank=self.rank,
-                    world=self.size,
-                    remote_buffers=self._next_buffers,
-                    work_lkey=self._work_mr.lkey,
-                    signal_addr=self._gpunetio.signal_mr.addr,
-                    signal_lkey=self._gpunetio.signal_mr.lkey,
-                    timeout_cycles=timeout_cycles,
+            if failed:
+                raise AllReduceError(
+                    "GPUNetIO all-reduce failed with DOCA status %d" % failed
                 )
-                _ibcuda.synchronize()
-                statuses = self._gpunetio.status.read_i32(self.num_sms)
-                failed = next((value for value in statuses if value != 0), 0)
-                if failed == -110:
-                    raise AllReduceTimeoutError(
-                        "timed out in the GPUNetIO all-reduce kernel"
-                    )
-                if failed:
-                    raise AllReduceError(
-                        "GPUNetIO all-reduce failed with DOCA status %d" % failed
-                    )
-                _check_deadline(deadline)
-                if tensor_ptr != work_ptr:
-                    self._kernels.copy(work_ptr, tensor_ptr, count, dtype_key)
-                    _ibcuda.synchronize()
-                    _check_deadline(deadline)
-                self._sequence += 1
-                return tensor
-
-            # Reduce-scatter.  Round k sends rank-k and receives rank-k-1;
-            # this is the exact chunk sequence in NCCL's Ring/Simple kernel.
-            for k in range(1, self.size):
-                send_owner = (self.rank - k) % self.size
-                recv_owner = (self.rank - k - 1) % self.size
-                self._round(
-                    _nccl_segments(
-                        count, itemsize, self.size, send_owner, self.num_sms
-                    ),
-                    _nccl_segments(
-                        count, itemsize, self.size, recv_owner, self.num_sms
-                    ),
-                    "scratch",
-                    self._notification(0, k - 1),
-                    deadline,
-                    itemsize,
-                )
-                _ibcuda.flush_gpudirect_writes()
-                self._kernels.reduce(
-                    work_ptr,
-                    scratch_ptr,
-                    count,
-                    dtype_key,
-                    itemsize,
-                    self.size,
-                    recv_owner,
-                )
-                _ibcuda.synchronize()
-                _check_deadline(deadline)
-
-            # All-gather.  Inbound writes land directly in the final work
-            # buffer; the flush orders them before the next QP reads it.
-            for k in range(0, self.size - 1):
-                send_owner = (self.rank - k) % self.size
-                recv_owner = (self.rank - k - 1) % self.size
-                self._round(
-                    _nccl_segments(
-                        count, itemsize, self.size, send_owner, self.num_sms
-                    ),
-                    _nccl_segments(
-                        count, itemsize, self.size, recv_owner, self.num_sms
-                    ),
-                    "work",
-                    self._notification(1, k),
-                    deadline,
-                    itemsize,
-                )
-                _ibcuda.flush_gpudirect_writes()
-                _ibcuda.synchronize()
-                _check_deadline(deadline)
-
+            _check_deadline(deadline)
             if tensor_ptr != work_ptr:
                 self._kernels.copy(work_ptr, tensor_ptr, count, dtype_key)
                 _ibcuda.synchronize()
                 _check_deadline(deadline)
-            self._sequence += 1
             return tensor
         except Exception:
             self._failed = True
             raise
+
+    def abort(self) -> None:
+        """Revoke the current communicator while retaining reconfigure state."""
+
+        if self._closed:
+            return
+        self._close_lanes()
+        self._failed = True
+        self._rank = -1
+        self._size = 0
+        self.uuid = None
+
+    def getRank(self) -> int:
+        """Return the rank assigned by the latest reconfiguration."""
+
+        return self._rank
+
+    def getSize(self) -> int:
+        """Return the world size assigned by the latest reconfiguration."""
+
+        return self._size
+
+    def getBackendName(self) -> str:
+        """Return the registered c10d backend name."""
+
+        return self.backend_name
+
+    def get_backend(self, device: Any) -> "ProcessGroup":
+        """Expose this backend through nightly's experimental accessor."""
+
+        del device
+        return self
+
+    def set_timeout(self, timeout: timedelta) -> None:
+        """Set the default timeout used by future collectives."""
+
+        self.timeout = timeout.total_seconds()
+
+    def shutdown(self) -> None:
+        """Release GPUNetIO, verbs, retained CUDA, and HCA resources."""
+
+        self.close()
 
     def close(self) -> None:
         """Close QPs, deregister staging buffers, and close the listener."""
@@ -1967,6 +1854,8 @@ class ProcessGroup:
         self._listener.close()
         self._scratch_mr.close()
         self._work_mr.close()
+        self.pd.close()
+        self.context.close()
         self._closed = True
 
     def __enter__(self) -> "ProcessGroup":
@@ -1977,10 +1866,49 @@ class ProcessGroup:
         return False
 
 
+def _create_backend(dist_options: Any, backend_options: Any) -> ProcessGroup:
+    if not isinstance(backend_options, ProcessGroupOptions):
+        raise TypeError("ibverbs backend requires ProcessGroupOptions")
+    stable_rank = backend_options.stable_rank
+    global_ranks = list(getattr(dist_options, "global_ranks_in_group", []))
+    if stable_rank is None and global_ranks:
+        stable_rank = global_ranks[dist_options.group_rank]
+        backend_options = replace(backend_options, stable_rank=stable_rank)
+    return ProcessGroup.create(
+        dist_options.store,
+        dist_options.group_rank,
+        dist_options.group_size,
+        backend_options,
+        dist_options.timeout,
+        initialize=not bool(dist_options.enable_reconfigure),
+        group_id=str(dist_options.group_id),
+    )
+
+
+def register_backend(name: str = "ibverbs") -> str:
+    """Register the nightly GPUNetIO PyProcessGroup as a CUDA-only backend."""
+
+    _require_torch_nightly()
+    normalized = name.lower()
+    plugin = dist.Backend._plugins.get(normalized.upper())
+    if plugin is None:
+        dist.Backend.register_backend(
+            normalized,
+            _create_backend,
+            extended_api=True,
+            devices=["cuda"],
+        )
+    elif plugin.creator_fn is not _create_backend:
+        raise RuntimeError("c10d backend %r is already registered" % normalized)
+    return normalized
+
+
 __all__ = [
     "AllReduceError",
     "AllReduceTimeoutError",
     "ProcessGroup",
+    "ProcessGroupOptions",
     "ReconfigureError",
     "Work",
+    "register_backend",
 ]
