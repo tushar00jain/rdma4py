@@ -11,7 +11,7 @@ import sys
 from pathlib import Path
 from typing import List, Optional, Sequence
 
-from experiments.tcp_multiflow import benchmark
+from experiments.tcp_multiflow import benchmark, python_benchmark
 
 
 def _flow_counts(value: str) -> List[int]:
@@ -59,6 +59,7 @@ def _tuned_result(results, target_gbps: float):
 
 def _write_csv(path: Path, results):
     fields = [
+        "engine",
         "write_size",
         "flow_count",
         "payload_gbps",
@@ -76,6 +77,8 @@ def _write_csv(path: Path, results):
 
 
 def run(args) -> int:
+    """Run every requested write-size/flow-count matrix point."""
+
     if args.counter_delay + args.sample_seconds >= args.duration:
         raise RuntimeError(
             "counter delay plus sample seconds must be less than measured duration"
@@ -83,6 +86,9 @@ def run(args) -> int:
     root = args.output_dir or benchmark._default_output_dir("sweep")
     root.mkdir(parents=True, exist_ok=True)
     results = []
+    runner = (
+        python_benchmark.run_local if args.engine == "python" else benchmark.run_local
+    )
     for length in args.lengths:
         for flows in args.flows:
             output_dir = root / _path_component(length) / ("flows-%02d" % flows)
@@ -99,15 +105,32 @@ def run(args) -> int:
                 omit=args.omit,
                 counter_delay=args.counter_delay,
                 sample_seconds=args.sample_seconds,
-                length=length,
+                length=(
+                    python_benchmark._size(length)
+                    if args.engine == "python"
+                    else length
+                ),
                 target_gbps=args.target_gbps,
                 reverse=args.reverse,
             )
             print("\n[%s, %d flows]" % (length, flows))
-            benchmark.run_local(run_args)
+            summary_path = output_dir / "summary.json"
+            cached_result = None
+            if args.resume and not args.dry_run and summary_path.is_file():
+                cached_result = json.loads(summary_path.read_text())
+                cached_engine = cached_result.get("engine", "iperf3")
+                if cached_engine != args.engine:
+                    raise RuntimeError(
+                        "cannot resume %s result with %s engine"
+                        % (cached_engine, args.engine)
+                    )
+                print("Reusing %s" % summary_path)
+            else:
+                runner(run_args)
             if args.dry_run:
                 continue
-            result = json.loads((output_dir / "summary.json").read_text())
+            result = cached_result or json.loads(summary_path.read_text())
+            result["engine"] = args.engine
             result["write_size"] = length
             result["output_dir"] = str(output_dir)
             results.append(result)
@@ -123,6 +146,7 @@ def run(args) -> int:
         )
         tuned[length] = choice
     report = {
+        "engine": args.engine,
         "interfaces": args.interfaces,
         "addresses": args.addresses,
         "direction": "reverse" if args.reverse else "forward",
@@ -176,13 +200,13 @@ def _parser() -> argparse.ArgumentParser:
         "--lengths",
         type=_lengths,
         default=["1K", "4K", "16K", "64K", "256K", "1M"],
-        help="comma-separated iperf3 write sizes (default: 1K,4K,16K,64K,256K,1M)",
+        help="comma-separated TCP write sizes (default: 1K,4K,16K,64K,256K,1M)",
     )
     parser.add_argument(
         "--flows",
         type=_flow_counts,
-        default=[1, 2, 4, 8, 16, 24],
-        help="comma-separated flow counts (default: 1,2,4,8,16,24)",
+        default=[1, 2, 4, 8, 16, 24, 32, 48],
+        help="comma-separated flow counts (default: 1,2,4,8,16,24,32,48)",
     )
     parser.add_argument("--duration", type=benchmark._positive_int, default=8)
     parser.add_argument("--omit", type=benchmark._nonnegative_int, default=1)
@@ -191,16 +215,29 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--target-gbps", type=benchmark._nonnegative_float, default=195.0
     )
+    parser.add_argument(
+        "--engine",
+        choices=["python", "iperf3"],
+        default="python",
+        help="TCP traffic generator (default: python)",
+    )
     parser.add_argument("--base-port", type=benchmark._positive_int, default=5201)
     parser.add_argument("--iperf3", default="iperf3")
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--reverse", action="store_true")
     parser.add_argument("--no-affinity", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="reuse completed matrix points in the output directory",
+    )
     return parser
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
+    """Parse command-line arguments and execute the scaling sweep."""
+
     args = _parser().parse_args(argv)
     try:
         return run(args)

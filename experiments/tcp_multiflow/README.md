@@ -1,10 +1,11 @@
 # Dual-NIC TCP line-rate experiment
 
 This experiment drives multi-flow TCP over the physical path between `eth1`
-and `eth2`. It launches one `iperf3` process per flow, pins each process to a
-CPU local to its NIC, and validates the path with matched NIC hardware
-counters. Separate processes also avoid the single-threaded parallel-stream
-limit in `iperf3` releases before 3.16.
+and `eth2`. The Python engine launches one sender and one receiver process per
+flow, uses Python's `socket.sendall` and `socket.recv_into` as the data path,
+and pins each process to a CPU local to its NIC. An `iperf3` engine remains
+available as a reference. Both engines validate the path with matched NIC
+hardware counters.
 
 The `local` mode benchmarks two peer NICs on one host without root privileges
 or network namespaces. `SO_BINDTODEVICE` forces the client data packets out of
@@ -21,6 +22,8 @@ source .venv/bin/activate
 
 ## Measured result
 
+### iperf3 reference
+
 Measured on two 200 Gb/s mlx5 links at MTU 1500 with `iperf3` 3.18:
 
 | Direction | Flows | TCP payload | Sender TX wire | Receiver RX wire | Retransmits |
@@ -34,35 +37,41 @@ counters, including the serialized preamble and inter-packet gap. The default
 195 Gb/s pass threshold represents 97.5% utilization of a 200 Gb/s link; these
 runs measured 100.12% and 100.09% over their five-second counter windows.
 
-### Payload and flow scaling
+### Python payload and flow scaling
 
 The scaling sweep measured these conservative physical wire rates in Gb/s,
 taking the lower of sender TX and receiver RX. Each cell is a three-second
-steady-state hardware-counter sample; bold entries meet the 195 Gb/s threshold.
+steady-state hardware-counter sample from the multi-process Python engine;
+bold entries meet the 195 Gb/s threshold.
 
-| `iperf3` write | 1 flow | 2 flows | 4 flows | 8 flows | 16 flows | 24 flows |
-|---|---:|---:|---:|---:|---:|---:|
-| 1 KiB | 11.31 | 19.00 | 38.78 | 79.01 | 134.03 | **197.42** |
-| 4 KiB | 22.96 | 47.68 | 86.47 | 155.91 | **200.58** | **200.83** |
-| 16 KiB | 30.84 | 69.95 | 92.44 | 174.10 | **200.50** | **200.55** |
-| 64 KiB | 33.11 | 66.75 | 128.22 | **199.63** | **199.12** | **200.73** |
-| 256 KiB | 37.32 | 70.74 | 134.94 | **198.96** | **200.24** | **200.21** |
-| 1 MiB | 29.97 | 62.14 | 111.33 | 164.99 | **200.58** | 194.57 |
+| Python write | 1 | 2 | 4 | 8 | 16 | 24 | 32 | 48 flows |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 KiB | 9.94 | 19.39 | 34.29 | 67.00 | 119.46 | 193.47 | **197.98** | **200.71** |
+| 4 KiB | 20.86 | 42.95 | 87.48 | 130.79 | 193.06 | **199.07** | **198.75** | **200.95** |
+| 16 KiB | 24.44 | 42.87 | 74.98 | 145.68 | 191.69 | **197.20** | **200.53** | **200.97** |
+| 64 KiB | 31.16 | 39.36 | 82.17 | 150.02 | 194.48 | 194.89 | **198.48** | 175.59 |
+| 256 KiB | 17.77 | 30.42 | 70.52 | 127.70 | **196.87** | 182.46 | **200.47** | 181.88 |
+| 1 MiB | 18.99 | 40.77 | 70.78 | 123.07 | 191.95 | **199.18** | **198.59** | 194.62 |
 
-The tuner selects the fewest flows that reach the threshold, rather than the
-largest flow count:
+All 48 points passed the physical-path counter check. Scaling is not monotonic:
+once the link is saturated, extra Python processes can add enough scheduling
+and cache pressure to reduce throughput.
 
-| Write size | Tuned flows | TCP payload | Physical wire | Retransmits |
+The final choices were rerun for 15 measured seconds with a five-second
+steady-state counter sample. The short sweep's first passing result was
+promoted to a larger flow count when it did not sustain the threshold:
+
+| Write size | Confirmed flows | TCP payload | Physical wire | Retransmits |
 |---|---:|---:|---:|---:|
-| 1 KiB | 24 | 182.57 Gb/s | 197.42 Gb/s | 0 |
-| 4 KiB | 16 | 185.72 Gb/s | 200.58 Gb/s | 0 |
-| 16 KiB | 16 | 185.25 Gb/s | 200.50 Gb/s | 0 |
-| 64 KiB | 8 | 183.05 Gb/s | 199.63 Gb/s | 0 |
-| 256 KiB | 8 | 182.83 Gb/s | 198.96 Gb/s | 0 |
-| 1 MiB | 16 | 185.48 Gb/s | 200.58 Gb/s | 0 |
+| 1 KiB | 32 | 184.85 Gb/s | 199.41 Gb/s | 0 |
+| 4 KiB | 32 | 171.80 Gb/s | 196.16 Gb/s | 5 |
+| 16 KiB | 48 | 184.86 Gb/s | 198.95 Gb/s | 1 |
+| 64 KiB | 32 | 184.34 Gb/s | 199.20 Gb/s | 0 |
+| 256 KiB | 16 | 180.70 Gb/s | 195.65 Gb/s | 0 |
+| 1 MiB | 24 | 184.30 Gb/s | 198.73 Gb/s | 2 |
 
-One isolated retransmit occurred outside the selected configurations. All 36
-matrix points passed the physical-path counter check.
+A reverse Python spot check with 1 MiB writes and 24 flows sustained
+196.28 Gb/s from `eth2` to `eth1` with one retransmit.
 
 ### TCP request/response latency
 
@@ -80,7 +89,7 @@ the physical NIC counters.
 | 4 KiB | 111.08 us | 264.13 us | 1559.85 us | 113.25 us | 144.94 us | 322.21 us |
 | 64 KiB | 222.09 us | 687.71 us | 1778.74 us | 209.66 us | 436.22 us | 1550.18 us |
 
-## Local benchmark
+## iperf3 reference benchmark
 
 Both NICs need carrier and an IPv4 or IPv6 address. They must be able to
 exchange frames through their external peer or switch. Install `iperf3` and
@@ -118,9 +127,27 @@ For repeatable results:
 Heavy retransmits indicate a real path problem. Check `ethtool -S`, MTU
 consistency, congestion, and socket buffer limits before adding more flows.
 
+## Python throughput benchmark
+
+Run one Python sender and receiver process per TCP flow with:
+
+```bash
+python -m experiments.tcp_multiflow.python_benchmark local \
+  --interfaces eth1,eth2 \
+  --addresses 2001:db8:1::1,2001:db8:1::2 \
+  --flows-per-nic 32 --length 64K \
+  --output-dir tcp_line_rate_results/python-local
+```
+
+This path does not invoke `iperf3`. Each sender repeatedly calls
+`socket.sendall` with the requested write size, while its paired receiver uses
+`socket.recv_into`. Separate processes bypass the GIL and are assigned to
+different NIC-local CPUs. Linux `TCP_INFO` supplies per-flow retransmit counts.
+The exit status and physical-counter validation match the reference benchmark.
+
 ## Scaling sweep
 
-Sweep the default six write sizes and six flow counts with:
+Sweep the default six write sizes and eight flow counts with the Python engine:
 
 ```bash
 python -m experiments.tcp_multiflow.sweep \
@@ -134,7 +161,8 @@ Each matrix point retains its full benchmark output. `sweep.json` contains the
 aggregate report and selected configuration per write size, while `sweep.csv`
 is convenient for plotting. A configuration is selected by taking the fewest
 flows that reach `--target-gbps`; if none do, the highest verified wire rate is
-selected.
+selected. `--resume` reuses completed points after an interrupted or expanded
+run. Pass `--engine iperf3` only when an iperf3 comparison is desired.
 
 ## Latency benchmark
 

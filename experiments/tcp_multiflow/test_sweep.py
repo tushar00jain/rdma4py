@@ -20,6 +20,13 @@ def test_sweep_values_are_validated():
         sweep._lengths("1K,1k")
 
 
+def test_sweep_defaults_to_python_and_scales_to_48_flows():
+    args = sweep._parser().parse_args([])
+
+    assert args.engine == "python"
+    assert args.flows == [1, 2, 4, 8, 16, 24, 32, 48]
+
+
 def test_tuning_uses_fewest_flows_that_reach_target():
     results = [
         {"flow_count": 1, "wire_gbps": 180.0, "path_verified": True},
@@ -53,7 +60,7 @@ def test_sweep_writes_aggregate_results(monkeypatch, tmp_path):
         )
         return 0
 
-    monkeypatch.setattr(sweep.benchmark, "run_local", run_local)
+    monkeypatch.setattr(sweep.python_benchmark, "run_local", run_local)
     args = sweep._parser().parse_args(
         [
             "--lengths",
@@ -73,6 +80,7 @@ def test_sweep_writes_aggregate_results(monkeypatch, tmp_path):
 
     assert sweep.run(args) == 0
     report = json.loads((tmp_path / "sweep.json").read_text())
+    assert report["engine"] == "python"
     assert report["tuned_by_write_size"]["4K"]["flow_count"] == 2
     assert len(report["results"]) == 3
     assert (tmp_path / "sweep.csv").is_file()
