@@ -209,6 +209,9 @@ tempCodeRunnerFile.py
 # PyPI configuration file
 .pypirc
 
+# Local dual-NIC TCP benchmark output
+tcp_line_rate_results/
+
 # Marimo
 marimo/_static/
 marimo/_lsp/

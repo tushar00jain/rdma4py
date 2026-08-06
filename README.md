@@ -72,6 +72,9 @@ Experimental code is kept outside the installable packages. The
 [fault-tolerant GPUNetIO all-reduce](experiments/fault_tolerant_allreduce/)
 implements a PyTorch-nightly `ProcessGroup`, timeout recovery, dynamic
 membership, and exact-byte NCCL comparison on top of `ibverbs`.
+The [dual-NIC TCP experiment](experiments/tcp_multiflow/) forces multi-flow
+traffic through two peer NICs on one host and verifies 200 Gb/s line rate with
+physical hardware counters.
 
 ## License
 
