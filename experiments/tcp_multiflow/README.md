@@ -12,6 +12,13 @@ the sender NIC even though Linux owns the receiver address locally. A run only
 passes when physical TX and RX counters agree within 2%, preventing a kernel
 loopback result from being mistaken for NIC bandwidth.
 
+Create the development environment with a uv-managed Python 3.14:
+
+```bash
+uv venv --python 3.14 --managed-python
+source .venv/bin/activate
+```
+
 ## Measured result
 
 Measured on two 200 Gb/s mlx5 links at MTU 1500 with `iperf3` 3.18:
@@ -26,6 +33,52 @@ TCP framing. Wire rate comes from mlx5 `*_bytes_phy` and `*_packets_phy`
 counters, including the serialized preamble and inter-packet gap. The default
 195 Gb/s pass threshold represents 97.5% utilization of a 200 Gb/s link; these
 runs measured 100.12% and 100.09% over their five-second counter windows.
+
+### Payload and flow scaling
+
+The scaling sweep measured these conservative physical wire rates in Gb/s,
+taking the lower of sender TX and receiver RX. Each cell is a three-second
+steady-state hardware-counter sample; bold entries meet the 195 Gb/s threshold.
+
+| `iperf3` write | 1 flow | 2 flows | 4 flows | 8 flows | 16 flows | 24 flows |
+|---|---:|---:|---:|---:|---:|---:|
+| 1 KiB | 11.31 | 19.00 | 38.78 | 79.01 | 134.03 | **197.42** |
+| 4 KiB | 22.96 | 47.68 | 86.47 | 155.91 | **200.58** | **200.83** |
+| 16 KiB | 30.84 | 69.95 | 92.44 | 174.10 | **200.50** | **200.55** |
+| 64 KiB | 33.11 | 66.75 | 128.22 | **199.63** | **199.12** | **200.73** |
+| 256 KiB | 37.32 | 70.74 | 134.94 | **198.96** | **200.24** | **200.21** |
+| 1 MiB | 29.97 | 62.14 | 111.33 | 164.99 | **200.58** | 194.57 |
+
+The tuner selects the fewest flows that reach the threshold, rather than the
+largest flow count:
+
+| Write size | Tuned flows | TCP payload | Physical wire | Retransmits |
+|---|---:|---:|---:|---:|
+| 1 KiB | 24 | 182.57 Gb/s | 197.42 Gb/s | 0 |
+| 4 KiB | 16 | 185.72 Gb/s | 200.58 Gb/s | 0 |
+| 16 KiB | 16 | 185.25 Gb/s | 200.50 Gb/s | 0 |
+| 64 KiB | 8 | 183.05 Gb/s | 199.63 Gb/s | 0 |
+| 256 KiB | 8 | 182.83 Gb/s | 198.96 Gb/s | 0 |
+| 1 MiB | 16 | 185.48 Gb/s | 200.58 Gb/s | 0 |
+
+One isolated retransmit occurred outside the selected configurations. All 36
+matrix points passed the physical-path counter check.
+
+### TCP request/response latency
+
+The latency benchmark sends one request at a time and waits for an identical
+response, so the reported value is application-level TCP round-trip latency.
+Both endpoints are pinned to NIC-local CPUs. These measurements used 10,000
+iterations after 1,000 warmups, and every request and response was observed in
+the physical NIC counters.
+
+| Payload | eth1 to eth2 median | p95 | p99 | eth2 to eth1 median | p95 | p99 |
+|---|---:|---:|---:|---:|---:|---:|
+| 1 B | 40.01 us | 80.73 us | 180.96 us | 38.61 us | 91.12 us | 399.29 us |
+| 64 B | 39.55 us | 99.28 us | 788.01 us | 41.27 us | 97.81 us | 404.72 us |
+| 1 KiB | 39.04 us | 96.16 us | 427.29 us | 38.21 us | 79.03 us | 181.65 us |
+| 4 KiB | 111.08 us | 264.13 us | 1559.85 us | 113.25 us | 144.94 us | 322.21 us |
+| 64 KiB | 222.09 us | 687.71 us | 1778.74 us | 209.66 us | 436.22 us | 1550.18 us |
 
 ## Local benchmark
 
@@ -64,6 +117,41 @@ For repeatable results:
 
 Heavy retransmits indicate a real path problem. Check `ethtool -S`, MTU
 consistency, congestion, and socket buffer limits before adding more flows.
+
+## Scaling sweep
+
+Sweep the default six write sizes and six flow counts with:
+
+```bash
+python -m experiments.tcp_multiflow.sweep \
+  --interfaces eth1,eth2 \
+  --addresses 2001:db8:1::1,2001:db8:1::2 \
+  --output-dir tcp_line_rate_results/sweep
+```
+
+Use `--lengths` and `--flows` to replace either comma-separated matrix axis.
+Each matrix point retains its full benchmark output. `sweep.json` contains the
+aggregate report and selected configuration per write size, while `sweep.csv`
+is convenient for plotting. A configuration is selected by taking the fewest
+flows that reach `--target-gbps`; if none do, the highest verified wire rate is
+selected.
+
+## Latency benchmark
+
+Measure TCP round-trip latency across the same physical NIC path with:
+
+```bash
+python -m experiments.tcp_multiflow.latency run \
+  --interfaces eth1,eth2 \
+  --addresses 2001:db8:1::1,2001:db8:1::2 \
+  --sizes 1,64,1K,4K,64K \
+  --output-dir tcp_line_rate_results/latency
+```
+
+The benchmark reports median, mean, p95, p99, minimum, and maximum RTT and
+writes the statistics and counter deltas to `latency.json`. Use `--reverse` to
+swap sender and receiver. It rejects the run if hardware counters do not
+observe both sides of every request/response exchange.
 
 ## Two-host benchmark
 
