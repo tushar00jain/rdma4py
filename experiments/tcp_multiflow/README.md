@@ -89,6 +89,65 @@ the physical NIC counters.
 | 4 KiB | 111.08 us | 264.13 us | 1559.85 us | 113.25 us | 144.94 us | 322.21 us |
 | 64 KiB | 222.09 us | 687.71 us | 1778.74 us | 209.66 us | 436.22 us | 1550.18 us |
 
+### Tensor transport
+
+`transport.py` is a reusable striped TCP transport for contiguous CPU tensors.
+It accepts NumPy arrays, writable buffer objects, and contiguous CPU PyTorch
+tensors. `SharedTensor` provides process-shared storage with zero-copy NumPy and
+PyTorch views so independent workers can place received data into one tensor.
+
+The process fast path divides each tensor into work units and lets the next
+available TCP flow claim the next unit. This avoids the slow-flow tail caused by
+equal static partitions. The sender and receiver stage data in NIC-local worker
+memory; `total_gbps` includes worker startup and source staging, while
+`payload_gbps` and physical NIC counters cover the network transfer interval.
+
+On this host, a byte-for-byte verified 64 MiB NumPy tensor repeated 1,024 times
+over 40 persistent flows and 16 MiB work units measured:
+
+| TCP tensor payload | Physical wire | Full API operation | Retransmits |
+|---:|---:|---:|---:|
+| 182.82 Gb/s | **196.90 Gb/s** | 174.28 Gb/s | 0 |
+
+The payload/wire difference is Ethernet, IPv6, and TCP framing at MTU 1500.
+The physical result exceeds the experiment's 195 Gb/s line-rate threshold and
+the `eth1` TX and `eth2` RX hardware counters agreed. The destination tensor was
+compared against the source after the transfer.
+
+Run the same verified benchmark with the tuned defaults:
+
+```bash
+python -m experiments.tcp_multiflow.tensor_benchmark \
+  --addresses 2001:db8:1::1,2001:db8:1::2 \
+  --output tcp_line_rate_results/tensor.json
+```
+
+The Python API uses the same defaults:
+
+```python
+from experiments.tcp_multiflow.transport import SharedTensor, transfer_tensor_local
+
+size = 64 << 20
+source_storage = SharedTensor(size)
+destination_storage = SharedTensor(size)
+source = source_storage.numpy((size,))
+destination = destination_storage.numpy((size,))
+source[:] = 7
+
+result = transfer_tensor_local(source, destination, iterations=1024)
+assert (source == destination).all()
+print(result.wire_gbps, result.payload_gbps, result.total_gbps)
+
+del source, destination
+source_storage.close()
+destination_storage.close()
+```
+
+The source must remain unchanged during `send()`. `iterations` sends the same
+tensor repeatedly over persistent connections; the destination contains the
+complete tensor when the call returns. Use `TensorSender` and `TensorReceiver`
+directly when the endpoints are on separate hosts.
+
 ## iperf3 reference benchmark
 
 Both NICs need carrier and an IPv4 or IPv6 address. They must be able to
