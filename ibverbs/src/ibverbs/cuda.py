@@ -126,6 +126,15 @@ class GpuMR:
         self.mr.close()
         self._tensor = None
 
+    def release_owner(self):
+        """Stop retaining the tensor after another owner assumes its lifetime.
+
+        Persistent registration caches can install a storage weakref and then
+        call this method so the registration itself does not prevent eviction.
+        The caller must keep the allocation alive until :meth:`close`.
+        """
+        self._tensor = None
+
     def __enter__(self):
         return self
 

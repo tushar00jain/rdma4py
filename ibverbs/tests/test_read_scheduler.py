@@ -191,6 +191,21 @@ def test_multiple_requests_share_one_pipeline_and_flush_callback_runs_once():
     assert flushes == [1]
 
 
+def test_write_many_stripes_chunks_and_uses_write_opcode():
+    scheduler, qps, _ = make_scheduler(qp_count=2, queue_depth=2, chunk_size=4)
+    request = ib.RdmaWriteRequest(FakeMR(20), 0x3000, 9, 20)
+
+    batch = scheduler.write_many([request])
+
+    assert batch.completed_bytes == 20
+    assert batch.completed_chunks == 5
+    work_requests = [wr for qp in qps for call in qp.post_calls for wr in call]
+    assert all(wr.opcode == ib.WROpcode.RDMA_WRITE for wr in work_requests)
+    assert sorted(wr.remote_addr for wr in work_requests) == list(
+        range(0x3000, 0x3000 + 20, 4)
+    )
+
+
 def test_async_wait_cooperatively_completes_a_batch():
     scheduler, _, _ = make_scheduler(qp_count=2, queue_depth=2, chunk_size=4)
     request = ib.RdmaReadRequest(FakeMR(24), 0x1000, 1, 24)

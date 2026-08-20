@@ -66,6 +66,7 @@ from .read_scheduler import (
     RdmaReadRequest,
     RdmaReadScheduler,
     RdmaReadTimeout,
+    RdmaWriteRequest,
 )
 
 __all__ = [
@@ -120,6 +121,7 @@ __all__ = [
     "RdmaReadRequest",
     "RdmaReadScheduler",
     "RdmaReadTimeout",
+    "RdmaWriteRequest",
 ]
 
 # `ibverbs.cuda` (optional GPUDirect helpers) is intentionally NOT imported

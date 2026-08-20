@@ -1,4 +1,4 @@
-"""Pipelined multi-QP RDMA reads over registered host or GPU memory.
+"""Pipelined multi-QP RDMA reads and writes over registered memory.
 
 This module is an optional policy layer over the low-level verbs objects.  It
 does not import torch or CUDA: a local buffer only needs to expose the same
@@ -93,6 +93,16 @@ class RdmaReadRequest:
 
 
 @dataclass(frozen=True)
+class RdmaWriteRequest(RdmaReadRequest):
+    """Describe one local source and one remote destination byte range.
+
+    The fields and validation are identical to :class:`RdmaReadRequest`, but
+    the local memory is the source of an RDMA WRITE rather than the destination
+    of an RDMA READ.
+    """
+
+
+@dataclass(frozen=True)
 class _ReadChunk:
     request_index: int
     request: RdmaReadRequest
@@ -117,7 +127,7 @@ class RdmaReadBatch:
     def __init__(
         self,
         scheduler: "RdmaReadScheduler",
-        requests: tuple[RdmaReadRequest, ...],
+        requests: tuple[RdmaReadRequest | RdmaWriteRequest, ...],
         total_chunks: int,
         on_complete: Callable[[], None] | None,
     ) -> None:
@@ -149,7 +159,7 @@ class RdmaReadBatch:
 
 
 class RdmaReadScheduler:
-    """Continuously pipeline a batch of RDMA reads over multiple RC QPs.
+    """Continuously pipeline RDMA reads or writes over multiple RC QPs.
 
     Use :meth:`create` to allocate QPs and CQs that share an existing context
     and protection domain.  Alternatively, inject already-created QPs and
@@ -395,7 +405,7 @@ class RdmaReadScheduler:
 
     def submit(
         self,
-        requests: Iterable[RdmaReadRequest],
+        requests: Iterable[RdmaReadRequest | RdmaWriteRequest],
         *,
         on_complete: Callable[[], None] | None = None,
     ) -> RdmaReadBatch:
@@ -412,8 +422,10 @@ class RdmaReadScheduler:
             raise TypeError("on_complete must be callable")
         converted = []
         for request in requests:
-            if not isinstance(request, RdmaReadRequest):
-                raise TypeError("requests must contain RdmaReadRequest objects")
+            if not isinstance(request, (RdmaReadRequest, RdmaWriteRequest)):
+                raise TypeError(
+                    "requests must contain RdmaReadRequest or RdmaWriteRequest objects"
+                )
             converted.append(request)
         request_tuple = tuple(converted)
         total_chunks = sum(
@@ -548,6 +560,13 @@ class RdmaReadScheduler:
         on_complete: Callable[[], None] | None = None,
     ) -> RdmaReadBatch:
         """Submit and synchronously wait for a complete read batch."""
+        requests = tuple(requests)
+        if any(
+            not isinstance(request, RdmaReadRequest)
+            or isinstance(request, RdmaWriteRequest)
+            for request in requests
+        ):
+            raise TypeError("read_many requests must contain RdmaReadRequest objects")
         return self.wait(
             self.submit(requests, on_complete=on_complete),
             timeout=timeout,
@@ -563,6 +582,53 @@ class RdmaReadScheduler:
         on_complete: Callable[[], None] | None = None,
     ) -> RdmaReadBatch:
         """Submit and asynchronously wait for a complete read batch."""
+        requests = tuple(requests)
+        if any(
+            not isinstance(request, RdmaReadRequest)
+            or isinstance(request, RdmaWriteRequest)
+            for request in requests
+        ):
+            raise TypeError(
+                "read_many_async requests must contain RdmaReadRequest objects"
+            )
+        return await self.wait_async(
+            self.submit(requests, on_complete=on_complete),
+            timeout=timeout,
+            idle_sleep=idle_sleep,
+        )
+
+    def write_many(
+        self,
+        requests: Iterable[RdmaWriteRequest],
+        *,
+        timeout: float | None = 30.0,
+        idle_sleep: float = 0.0,
+        on_complete: Callable[[], None] | None = None,
+    ) -> RdmaReadBatch:
+        """Submit and synchronously wait for a complete write batch."""
+        requests = tuple(requests)
+        if any(not isinstance(request, RdmaWriteRequest) for request in requests):
+            raise TypeError("write_many requests must contain RdmaWriteRequest objects")
+        return self.wait(
+            self.submit(requests, on_complete=on_complete),
+            timeout=timeout,
+            idle_sleep=idle_sleep,
+        )
+
+    async def write_many_async(
+        self,
+        requests: Iterable[RdmaWriteRequest],
+        *,
+        timeout: float | None = 30.0,
+        idle_sleep: float = 0.0,
+        on_complete: Callable[[], None] | None = None,
+    ) -> RdmaReadBatch:
+        """Submit and asynchronously wait for a complete write batch."""
+        requests = tuple(requests)
+        if any(not isinstance(request, RdmaWriteRequest) for request in requests):
+            raise TypeError(
+                "write_many_async requests must contain RdmaWriteRequest objects"
+            )
         return await self.wait_async(
             self.submit(requests, on_complete=on_complete),
             timeout=timeout,
@@ -591,7 +657,7 @@ class RdmaReadScheduler:
         return False
 
     def _iter_chunks(
-        self, requests: tuple[RdmaReadRequest, ...]
+        self, requests: tuple[RdmaReadRequest | RdmaWriteRequest, ...]
     ) -> Iterable[_ReadChunk]:
         for request_index, request in enumerate(requests):
             for offset in range(0, request.length, self.chunk_size):
@@ -627,7 +693,11 @@ class RdmaReadScheduler:
                 wr = SendWR(
                     wr_id=wr_id,
                     sg_list=[request.local_mr.sge(chunk.length, offset=local_offset)],
-                    opcode=WROpcode.RDMA_READ,
+                    opcode=(
+                        WROpcode.RDMA_WRITE
+                        if isinstance(request, RdmaWriteRequest)
+                        else WROpcode.RDMA_READ
+                    ),
                     send_flags=SendFlags.SIGNALED,
                     remote_addr=remote_addr,
                     rkey=request.rkey,
@@ -744,4 +814,5 @@ __all__ = [
     "RdmaReadRequest",
     "RdmaReadScheduler",
     "RdmaReadTimeout",
+    "RdmaWriteRequest",
 ]
