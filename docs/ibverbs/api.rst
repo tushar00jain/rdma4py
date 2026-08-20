@@ -16,6 +16,13 @@ Helpers
    :members:
    :undoc-members:
 
+Pipelined RDMA reads
+--------------------
+
+.. automodule:: ibverbs.read_scheduler
+   :members:
+   :undoc-members:
+
 CUDA
 ----
 

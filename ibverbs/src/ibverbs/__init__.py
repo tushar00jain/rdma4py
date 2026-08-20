@@ -60,6 +60,13 @@ from .enums import (
     WROpcode,
 )
 from .helpers import connect_rc, local_qp_info, QPInfo, reg_tensor, tensor_addr_len
+from .read_scheduler import (
+    RdmaReadBatch,
+    RdmaReadError,
+    RdmaReadRequest,
+    RdmaReadScheduler,
+    RdmaReadTimeout,
+)
 
 __all__ = [
     "__version__",
@@ -107,6 +114,12 @@ __all__ = [
     "local_qp_info",
     "reg_tensor",
     "tensor_addr_len",
+    # optional high-level read scheduler
+    "RdmaReadBatch",
+    "RdmaReadError",
+    "RdmaReadRequest",
+    "RdmaReadScheduler",
+    "RdmaReadTimeout",
 ]
 
 # `ibverbs.cuda` (optional GPUDirect helpers) is intentionally NOT imported
